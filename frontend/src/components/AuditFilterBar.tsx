@@ -41,6 +41,8 @@ const REGISTRY_OPERATION_OPTIONS = [
 
 const MCP_OPERATION_OPTIONS = [
   { value: '', label: 'All Methods' },
+  { value: 'mcp', label: 'MCP Transport' },
+  { value: 'server/discover', label: 'Server Discovery' },
   { value: 'initialize', label: 'Initialize' },
   { value: 'tools/list', label: 'Tools List' },
   { value: 'tools/call', label: 'Tools Call' },

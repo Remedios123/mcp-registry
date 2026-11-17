@@ -88,6 +88,8 @@ function buildEntityScopeGroups(
 // proxied non-MCP entities. The legacy MCP "*"/"all" wildcard does NOT authorize
 // an HTTP verb server-side, so proxied entities use explicit verbs or "http:*".
 const MCP_METHODS = [
+  'mcp',
+  'server/discover',
   'initialize',
   'notifications/initialized',
   'ping',

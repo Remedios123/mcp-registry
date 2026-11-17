@@ -15,7 +15,11 @@ import {
   LABEL,
 } from '../../formFields';
 import Button from '../../Button';
-import { LIST_BEFORE_CONSENT_MODES } from '../../../utils/egressAuth';
+import {
+  LIST_BEFORE_CONSENT_MODES,
+  listEnterpriseCredentialProfiles,
+  type EnterpriseCredentialProfile,
+} from '../../../utils/egressAuth';
 
 /**
  * Shape of the server edit form state. Owned by the Dashboard (kept as state
@@ -140,6 +144,21 @@ const ServerEditModal: React.FC<ServerEditModalProps> = ({
   // the backend serves a borrowed discovery token only when EGRESS_AUTH_ENABLED,
   // which requires a gateway, and local (stdio) servers have no HTTP egress.
   const egressFeatureAvailable = egressEnabled && withGateway && form.deployment !== 'local';
+  const [enterpriseProfiles, setEnterpriseProfiles] = React.useState<EnterpriseCredentialProfile[]>([]);
+  const [enterpriseProfilesError, setEnterpriseProfilesError] = React.useState(false);
+  const isEnterpriseCredential = form.egress_provider.startsWith('enterprise/');
+  const showProviderSelection = egressFeatureAvailable && form.egress_auth_mode === 'oauth_user';
+  React.useEffect(() => {
+    if (!showProviderSelection) return;
+    const controller = new AbortController();
+    setEnterpriseProfilesError(false);
+    listEnterpriseCredentialProfiles(controller.signal)
+      .then((profiles) => setEnterpriseProfiles(profiles))
+      .catch(() => {
+        if (!controller.signal.aborted) setEnterpriseProfilesError(true);
+      });
+    return () => controller.abort();
+  }, [showProviderSelection]);
   return (
     <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4 z-50">
       <div
@@ -483,7 +502,7 @@ const ServerEditModal: React.FC<ServerEditModalProps> = ({
                     </p>
                   </div>
                 )}
-                {form.egress_auth_mode === 'oauth_user' && (
+                {form.egress_auth_mode === 'oauth_user' && !isEnterpriseCredential && (
                   <p className="text-xs text-gray-500 dark:text-gray-400">
                     Register this callback URL in your OAuth app:{' '}
                     <code className="text-purple-600 dark:text-purple-400">
@@ -493,8 +512,9 @@ const ServerEditModal: React.FC<ServerEditModalProps> = ({
                 )}
                 {form.egress_auth_mode === 'oauth_user' && (
                   <div>
-                    <label className={LABEL}>Provider</label>
+                    <label htmlFor="egress-provider" className={LABEL}>Provider</label>
                     <select
+                      id="egress-provider"
                       value={form.egress_provider}
                       onChange={(e) =>
                         setForm((prev) => ({ ...prev, egress_provider: e.target.value }))
@@ -508,10 +528,25 @@ const ServerEditModal: React.FC<ServerEditModalProps> = ({
                       <option value="microsoft">Microsoft</option>
                       <option value="slack">Slack</option>
                       <option value="custom">Custom OIDC</option>
+                      {enterpriseProfiles.length > 0 && (
+                        <optgroup label="Enterprise credentials">
+                          {enterpriseProfiles.map(({ value, label }) => (
+                            <option key={value} value={value}>{label}</option>
+                          ))}
+                        </optgroup>
+                      )}
+                      {isEnterpriseCredential && !enterpriseProfiles.some(({ value }) => value === form.egress_provider) && (
+                        <option value={form.egress_provider} disabled>
+                          {form.egress_provider.slice('enterprise/'.length)}
+                        </option>
+                      )}
                     </select>
+                    {enterpriseProfilesError && (
+                      <p className="text-xs text-fg-muted">Could not load enterprise credential profiles.</p>
+                    )}
                   </div>
                 )}
-                {form.egress_auth_mode === 'oauth_user' && form.egress_provider && (
+                {form.egress_auth_mode === 'oauth_user' && form.egress_provider && !isEnterpriseCredential && (
                   <>
                     <div>
                       <label className={LABEL}>Client ID</label>

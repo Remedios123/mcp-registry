@@ -7,6 +7,21 @@
  */
 import axios from 'axios';
 
+export interface EnterpriseCredentialProfile {
+  value: string;
+  label: string;
+}
+
+export async function listEnterpriseCredentialProfiles(
+  signal: AbortSignal,
+): Promise<EnterpriseCredentialProfile[]> {
+  const response = await axios.get<EnterpriseCredentialProfile[]>(
+    '/api/egress-auth/enterprise-profiles',
+    { signal },
+  );
+  return response.data;
+}
+
 export interface EgressConnection {
   provider: string;
   server_path: string;

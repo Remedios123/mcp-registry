@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { render, screen, fireEvent } from '@testing-library/react';
 import ServerEditModal, { ServerEditForm } from '../ServerEditModal';
+import * as egressAuth from '../../../../utils/egressAuth';
 
 const baseForm: ServerEditForm = {
   name: 'My Server',
@@ -395,4 +396,20 @@ describe('ServerEditModal', () => {
       expect(screen.queryByText(/no stored tools yet/)).not.toBeInTheDocument();
     });
   });
+});
+
+
+test('renders and reopens the UC profile in the provider selector', async () => {
+  const profiles = jest.spyOn(egressAuth, 'listEnterpriseCredentialProfiles')
+    .mockResolvedValue([{ value: 'enterprise/uc', label: 'UC' }]);
+  try {
+    render(<Harness initial={{
+      ...baseForm, egress_auth_mode: 'oauth_user', egress_provider: 'enterprise/uc',
+    }} egressEnabled />);
+    const uc = await screen.findByRole('option', { name: 'UC' });
+    expect(uc.closest('select')).toHaveValue('enterprise/uc');
+    expect(screen.queryByText('Client Secret')).not.toBeInTheDocument();
+  } finally {
+    profiles.mockRestore();
+  }
 });
