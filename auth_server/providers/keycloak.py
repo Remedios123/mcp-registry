@@ -611,6 +611,13 @@ class KeycloakProvider(AuthProvider):
             return [self._rewrite_internal_urls(value) for value in node]
         return node
 
+    def native_authorization_server_metadata(self) -> dict[str, Any]:
+        """Read the discovery document with Keycloak's own issuer and endpoint URLs."""
+        document = self._get_openid_configuration()
+        if document.get("issuer") != self.external_realm_url:
+            raise ValueError("Keycloak issuer differs from KEYCLOAK_EXTERNAL_URL and KEYCLOAK_REALM")
+        return document
+
     def authorization_server_metadata(self) -> dict[str, Any]:
         """Return Keycloak's RFC 8414 metadata, with internal hostnames rewritten.
 

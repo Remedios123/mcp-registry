@@ -512,6 +512,38 @@ server {
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_same_origin_keycloak_discovery_aliases(nginx_service, enabled):
+    template = """server {
+    # {{KEYCLOAK_LOCATIONS_START}}
+    location /realms/ { proxy_pass http://keycloak:8080; }
+    # {{KEYCLOAK_LOCATIONS_END}}
+}"""
+    with (
+        patch("builtins.open", mock_open(read_data=template)),
+        patch.object(nginx_service, "get_additional_server_names", return_value=""),
+        patch.object(nginx_service, "_generate_virtual_server_blocks", return_value=""),
+        patch.object(nginx_service, "_generate_generic_proxy_blocks", return_value=[]),
+        patch("registry.repositories.factory.get_virtual_server_repository") as repository,
+        patch.dict("os.environ", {"AUTH_PROVIDER": "keycloak"}),
+        patch.object(nginx_module.settings, "registry_url", "https://gw.example.test"),
+        patch.object(nginx_module.settings, "a2a_reverse_proxy_effective", False),
+        patch.object(nginx_module.settings, "mcp_oauth_as_on_gateway_realm", enabled),
+        patch.object(nginx_module.settings, "keycloak_realm", "example-realm"),
+    ):
+        repository.return_value.list_enabled = AsyncMock(return_value=[])
+        rendered = await nginx_service._render_config_impl({})
+
+    assert rendered is not None
+    for name in ("openid-configuration", "oauth-authorization-server"):
+        alias = f"location = /realms/example-realm/.well-known/{name}"
+        rewrite = f"rewrite ^ /.well-known/{name}/realms/example-realm last;"
+        assert (alias in rendered) is enabled
+        assert (rewrite in rendered) is enabled
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_a2a_blocks_emitted_when_flag_enabled(
     nginx_service, sample_servers, mock_health_service, mock_atomic_write
 ):

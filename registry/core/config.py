@@ -638,6 +638,13 @@ class Settings(BaseSettings):
             "Set to false only in local/dev environments."
         ),
     )
+    mcp_oauth_as_on_gateway_realm: bool = Field(
+        default=False,
+        description=(
+            "Serve path-aware MCP OAuth discovery for Keycloak on the gateway origin. "
+            "Requires KEYCLOAK_EXTERNAL_URL and Keycloak's KC_HOSTNAME to match REGISTRY_URL."
+        ),
+    )
     mcp_resource_documentation_url: str | None = Field(
         default=None,
         description=(

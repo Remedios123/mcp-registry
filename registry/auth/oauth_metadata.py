@@ -71,7 +71,7 @@ def build_per_server_prm_url(
     base = build_canonical_resource_url(registry_url)
     seg = server_path.strip("/")
     suffix = seg
-    if append_mcp and not suffix.endswith("mcp"):
+    if append_mcp and suffix != "mcp" and not suffix.endswith("/mcp"):
         suffix = f"{suffix}/mcp" if suffix else "mcp"
     return f"{base}{WELLKNOWN_PRM_PATH}/{suffix}" if suffix else f"{base}{WELLKNOWN_PRM_PATH}"
 

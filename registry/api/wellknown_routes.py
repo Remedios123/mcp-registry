@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from collections.abc import Iterable
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -252,6 +253,22 @@ def _get_active_auth_provider():
     return get_auth_provider()
 
 
+def _same_origin_keycloak_issuer() -> str | None:
+    if (
+        settings.auth_provider != "keycloak"
+        or getattr(settings, "mcp_oauth_as_on_gateway_realm", False) is not True
+    ):
+        return None
+    resource = build_canonical_resource_url(settings.registry_url)
+    return f"{resource}/realms/{settings.keycloak_realm}"
+
+
+def _validate_prm_issuer(document: dict[str, Any]) -> None:
+    issuer = _same_origin_keycloak_issuer()
+    if issuer and document.get("authorization_servers") != [issuer]:
+        raise ValueError("Keycloak discovery does not match the configured gateway realm")
+
+
 def server_needs_per_server_prm(egress_auth_mode: str | None) -> bool:
     """Whether a server should advertise a per-server RFC 9728 PRM (vs the global one).
 
@@ -259,6 +276,7 @@ def server_needs_per_server_prm(egress_auth_mode: str | None) -> bool:
     (the ingress login must target a path-qualified App ID URI, not the bare
     origin). It applies to:
 
+    - every server on an opt-in same-origin Keycloak deployment,
     - ``obo_exchange`` on any provider (the same-IdP exchange always logs the user
       in at the gateway against a per-server resource),
     - ``oauth_user`` ONLY on Entra. The 3LO vault's ingress leg is a gateway login
@@ -283,7 +301,7 @@ def server_needs_per_server_prm(egress_auth_mode: str | None) -> bool:
     provider advertises ``derive_supported_scopes()`` (see
     ``get_oauth_protected_resource_for_server``).
     """
-    if egress_auth_mode == "obo_exchange":
+    if _same_origin_keycloak_issuer() or egress_auth_mode == "obo_exchange":
         return True
     if egress_auth_mode == "oauth_user":
         return entra_forces_per_server_prm(settings.auth_provider)
@@ -334,7 +352,7 @@ async def virtual_server_needs_per_server_prm(
         Exception: A backing-server lookup failure propagates so the caller can
             fail closed rather than silently advertising the wrong resource.
     """
-    if entra_forces_per_server_prm(settings.auth_provider):
+    if _same_origin_keycloak_issuer() or entra_forces_per_server_prm(settings.auth_provider):
         return True
     for backend_path in sorted(set(backend_paths)):
         info = await server_service.get_server_info(backend_path)
@@ -379,6 +397,7 @@ async def get_oauth_protected_resource() -> JSONResponse:
             scopes_supported=scopes_supported,
             resource_documentation=build_resource_documentation_url(),
         )
+        _validate_prm_issuer(document)
     except NotImplementedError as exc:
         logger.error(
             f"Active auth provider has not implemented authorization_server_metadata(): {exc}"
@@ -522,6 +541,7 @@ async def get_oauth_protected_resource_for_server(
             scopes_supported=scopes_supported,
             resource_documentation=build_resource_documentation_url(),
         )
+        _validate_prm_issuer(document)
     except NotImplementedError as exc:
         raise HTTPException(
             status_code=501,
@@ -562,7 +582,25 @@ async def get_oauth_authorization_server() -> JSONResponse:
         ) from exc
 
     try:
-        document = provider.authorization_server_metadata()
+        issuer = _same_origin_keycloak_issuer()
+        if issuer is None:
+            document = provider.authorization_server_metadata()
+        else:
+            document = provider.native_authorization_server_metadata()
+            if document.get("issuer") != issuer:
+                raise ValueError("Keycloak must publish the configured gateway realm issuer")
+            for key in (
+                "authorization_endpoint",
+                "token_endpoint",
+                "jwks_uri",
+                "registration_endpoint",
+            ):
+                endpoint = document.get(key)
+                if not isinstance(endpoint, str) or not endpoint.startswith(f"{issuer}/"):
+                    raise ValueError(f"Keycloak must publish {key} on the gateway realm")
+            methods = document.get("token_endpoint_auth_methods_supported", [])
+            if "none" not in methods:
+                document = {**document, "token_endpoint_auth_methods_supported": [*methods, "none"]}
     except NotImplementedError as exc:
         logger.error(
             f"Active auth provider has not implemented authorization_server_metadata(): {exc}"
@@ -579,3 +617,12 @@ async def get_oauth_authorization_server() -> JSONResponse:
         ) from exc
 
     return JSONResponse(content=document, headers=OAUTH_DISCOVERY_CACHE_HEADERS)
+
+
+@router.get("/oauth-authorization-server/realms/{realm}", include_in_schema=False)
+@router.get("/openid-configuration/realms/{realm}", include_in_schema=False)
+async def get_keycloak_authorization_server_for_realm(realm: str) -> JSONResponse:
+    """Serve discovery at the well-known insertion point for the gateway realm."""
+    if not _same_origin_keycloak_issuer() or realm != settings.keycloak_realm:
+        raise HTTPException(status_code=404, detail="Not found")
+    return await get_oauth_authorization_server()

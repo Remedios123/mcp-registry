@@ -867,7 +867,7 @@ def _is_unrendered_template(
         the read error).
     """
     try:
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
     except OSError:
         return False
     for marker in _UNRENDERED_TEMPLATE_MARKERS:
@@ -1307,7 +1307,7 @@ class NginxConfigService:
                 logger.warning(f"Nginx template not found at {self.nginx_template_path}")
                 return None
 
-            with open(self.nginx_template_path) as f:
+            with open(self.nginx_template_path, encoding="utf-8") as f:
                 template_content = f.read()
 
             # Local-dev / Podman compatibility:
@@ -1419,6 +1419,26 @@ class NginxConfigService:
                 )
                 logger.info(
                     f"AUTH_PROVIDER is '{auth_provider}', removed Keycloak location blocks from nginx config"
+                )
+
+            if (
+                auth_provider == "keycloak"
+                and getattr(settings, "mcp_oauth_as_on_gateway_realm", False) is True
+            ):
+                realm = settings.keycloak_realm
+                if not re.fullmatch(r"[A-Za-z0-9_.-]+", realm) or realm in {".", ".."}:
+                    raise ValueError("KEYCLOAK_REALM must be a single URL path segment")
+                # Point the two realm-suffix discovery URLs at the same metadata
+                # handler as the RFC 8414 inserted URL. Other realm requests
+                # still use the installed Keycloak proxy and its TLS settings.
+                locations = "\n".join(
+                    f"    location = /realms/{realm}/.well-known/{name} {{\n"
+                    f"        rewrite ^ /.well-known/{name}/realms/{realm} last;\n"
+                    "    }"
+                    for name in ("openid-configuration", "oauth-authorization-server")
+                )
+                template_content = template_content.replace(
+                    "    # {{KEYCLOAK_LOCATIONS_START}}", locations
                 )
 
             # Strip PingFederate location blocks from nginx config when not using PingFederate
