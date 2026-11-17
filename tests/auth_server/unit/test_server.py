@@ -7891,17 +7891,23 @@ class TestVendEgressTokenTransientClassification:
             got = await server_module._vend_egress_token("proxy-tok", "github")
         assert got == body
 
-    async def test_terminal_non_2xx_returns_none_not_unavailable(self):
-        # A 401/403/404 is a terminal deny (bad internal token, feature off,
-        # unregistered upstream) -- not a transient blip. It must NOT be retried
-        # as unavailable; the proxy falls through to its existing handling.
+    @pytest.mark.parametrize("code", [401, 403, 404])
+    async def test_terminal_non_2xx_denies_without_forwarding(self, code):
         import auth_server.server as server_module
 
         p_url, p_tok = self._patches(server_module)
-        for code in (401, 403, 404):
-            with p_url, p_tok, _patch_vend_httpx(status_code=code, json_body={}):
-                got = await server_module._vend_egress_token("proxy-tok", "github")
-                assert got is None
+        with p_url, p_tok, _patch_vend_httpx(status_code=code, json_body={}):
+            with pytest.raises(server_module.EgressVendDenied):
+                await server_module._vend_egress_token("proxy-tok", "github")
+
+    @pytest.mark.parametrize("body", [None, [], {"access_token": 42}])
+    async def test_malformed_success_fails_closed(self, body):
+        import auth_server.server as server_module
+
+        p_url, p_tok = self._patches(server_module)
+        with p_url, p_tok, _patch_vend_httpx(status_code=200, json_body=body):
+            with pytest.raises(server_module.EgressVendUnavailable):
+                await server_module._vend_egress_token("proxy-tok", "github")
 
 
 class TestEgressVendTimeoutCoupling:

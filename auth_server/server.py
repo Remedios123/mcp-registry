@@ -551,6 +551,16 @@ def _claim_str(value: object) -> str | None:
     return None
 
 
+def _verified_keycloak_employee_id(validation_result: dict) -> str:
+    """Read the protected employee claim from a verified Keycloak token."""
+    if validation_result.get("method") != "keycloak":
+        return ""
+    claimant = (validation_result.get("data") or {}).get("employee_id")
+    if isinstance(claimant, str) and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}", claimant):
+        return claimant
+    return ""
+
+
 def _audit_identity_display(validation_result: dict) -> str:
     """The human-readable identity to record in AUDIT logs, for ONE human.
 
@@ -586,6 +596,9 @@ def _audit_identity_display(validation_result: dict) -> str:
     Forward-only: this changes what NEW audit records store. Historical
     ``sub``-only rows are not backfilled (no durable sub->email map exists).
     """
+    employee_id = _verified_keycloak_employee_id(validation_result)
+    if employee_id:
+        return employee_id
     data = validation_result.get("data") or {}
     for candidate in (
         data.get("email"),
@@ -953,6 +966,7 @@ def _attach_mcp_proxy_token(
     egress_user: str = "",
     audit_identity: dict | None = None,
     obo_subject_sha256: str = "",
+    enterprise_employee_id: str = "",
 ) -> None:
     """Mint and attach the X-Internal-Token for the /mcp-proxy hop.
 
@@ -1030,6 +1044,7 @@ def _attach_mcp_proxy_token(
             egress_user=egress_user,
             audit_identity=audit_identity,
             obo_subject_sha256=obo_subject_sha256,
+            enterprise_employee_id=enterprise_employee_id,
             version_id=version_id,
             virtual_backend=virtual_backend,
         )
@@ -5640,6 +5655,7 @@ async def validate_request(request: Request):
         # one human -- avoids the preferred_username-vs-sub divergence that made
         # the browser-consent and bearer-vend paths miss on Entra.
         _egress_user = _canonical_egress_user(validation_result)
+        employee_id = _verified_keycloak_employee_id(validation_result)
 
         _attach_mcp_proxy_token(
             request,
@@ -5649,6 +5665,7 @@ async def validate_request(request: Request):
             server_name=server_name or "",
             auth_method=_canon_auth_method,
             egress_user=_egress_user,
+            enterprise_employee_id=employee_id,
             # Sign the audit identity resolved from the VERIFIED claims so the
             # mcp-proxy hop attributes its OBO mint record from this, not from
             # the raw ingress header it also receives. `request_id` rides along
@@ -8614,6 +8631,10 @@ _GENERIC_INTERNAL_STRIP_HEADERS: frozenset[str] = frozenset(
 )
 
 
+class EgressVendDenied(Exception):
+    """The credential lookup refused the authorized proxy hop."""
+
+
 class EgressVendUnavailable(Exception):
     """The registry's egress-token vend failed *transiently* -- the registry was
     unreachable/timed out, or it answered 5xx after riding out its own bounded
@@ -8724,7 +8745,7 @@ async def _vend_egress_token(
     registered_server: str,
     *,
     include_pre_consent_tools: bool = False,
-) -> dict | None:
+) -> dict:
     """Vend for the registered server path bound by the verified proxy token.
 
     ``include_pre_consent_tools`` asks the registry to return the server's
@@ -8737,8 +8758,8 @@ async def _vend_egress_token(
     Raises ``EgressVendUnavailable`` on a *transient* failure (registry
     unreachable/timeout, or a 5xx after the registry exhausted its own Vault
     retries) so the caller can surface a retryable signal instead of forwarding
-    tokenless. Returns None only for a terminal, non-retryable error (e.g. the
-    feature is off or the internal token was rejected).
+    tokenless. A refusal raises ``EgressVendDenied``. A successful Registry
+    response is required even when the server has no credential configured.
     """
     from registry.auth.internal import generate_internal_token
 
@@ -8746,8 +8767,8 @@ async def _vend_egress_token(
     try:
         service_token = generate_internal_token(subject="auth-server", purpose="egress-token-vend")
     except ValueError as exc:
-        logger.error(f"egress vend: cannot mint internal service token: {exc}")
-        return None
+        logger.error("egress vend: cannot mint internal service token")
+        raise EgressVendUnavailable("cannot mint internal service token") from exc
 
     try:
         # Pooled, process-lifetime PLAIN client for this in-cluster registry hop
@@ -8793,13 +8814,22 @@ async def _vend_egress_token(
         )
         raise EgressVendUnavailable(f"registry returned {resp.status_code}")
 
+    if resp.status_code in {401, 403, 404}:
+        raise EgressVendDenied("registry refused egress credential access")
     if resp.status_code != 200:
         logger.warning(f"egress vend: registry returned {resp.status_code}")
-        return None
+        raise EgressVendUnavailable(f"registry returned {resp.status_code}")
     try:
-        return resp.json()
-    except ValueError:
-        return None
+        response = resp.json()
+    except ValueError as exc:
+        raise EgressVendUnavailable("registry returned invalid JSON") from exc
+    if not isinstance(response, dict) or not (
+        response.get("consent_required") is True
+        or isinstance(response.get("access_token"), str) and response["access_token"]
+        or response.get("mode") in ("obo_exchange", "pat")
+    ):
+        raise EgressVendUnavailable("registry returned an invalid credential response")
+    return response
 
 
 async def _vend_generic_upstream_headers(
@@ -10028,6 +10058,13 @@ async def mcp_proxy(
                     registered_server,
                     include_pre_consent_tools=direct_route and incoming_method == "tools/list",
                 )
+            except EgressVendDenied:
+                req_id = incoming_payload.get("id") if isinstance(incoming_payload, dict) else None
+                return JSONResponse(status_code=403, content={
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32003, "message": "Access to the business credential was denied"},
+                })
             except EgressVendUnavailable as exc:
                 # Transient vend failure: fail closed with a retryable signal
                 # rather than forwarding tokenless (-> silent upstream 401) or
@@ -10376,7 +10413,9 @@ async def mcp_proxy(
                 upstream_url,
                 content=request_body,
                 headers=forward_headers,
-                params=dict(request.query_params),
+                # Do not let HTTPX replace the query of the registered URL
+                # with untrusted ingress parameters when injecting credentials.
+                params=None if egress_token_injected else dict(request.query_params),
                 timeout=proxy_timeout,
             ) as upstream_response,
         ):

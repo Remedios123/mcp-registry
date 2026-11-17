@@ -529,3 +529,34 @@ class TestOboExchangeVendDefense:
         r = _post(client)
         assert r.status_code == 403
         assert "not allowed" in r.json()["detail"]
+
+
+def test_enterprise_vends_using_the_signed_employee_claim(make_client, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    vend = AsyncMock(return_value=routes.enterprise.Credential(token="fixture-uc-token"))
+    monkeypatch.setattr(routes.enterprise, "vend", vend)
+    client = make_client(
+        _claims(enterprise_employee_id="EMP001"),
+        _server(egress_oauth={"provider": "enterprise/uc"}),
+    )
+
+    response = _post(client)
+
+    assert response.json()["access_token"] == "fixture-uc-token"
+    vend.assert_awaited_once_with("enterprise/uc", "EMP001", "https://api.githubcopilot.com/mcp")
+    assert not client._svc.called
+
+
+def test_enterprise_vend_refuses_a_non_employee_authentication_method(make_client, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    vend = AsyncMock()
+    monkeypatch.setattr(routes.enterprise, "vend", vend)
+    client = make_client(
+        _claims(auth_method="network-trusted"),
+        _server(egress_oauth={"provider": "enterprise/uc"}),
+    )
+
+    assert _post(client).status_code == 403
+    vend.assert_not_awaited()

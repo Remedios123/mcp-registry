@@ -1,0 +1,16 @@
+[project]
+name = "cas-shim"
+version = "0.1.0"
+description = "OIDC IdP facade over company CAS login (ST -> /uc/sso/auth business token)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+    "pyjwt[crypto]>=2.9",
+    "python-multipart>=0.0.32",
+    "pymongo>=4.19.0",
+]
+
+[tool.uv]
+package = false

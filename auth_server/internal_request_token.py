@@ -230,6 +230,7 @@ def mint_mcp_proxy_token(
     version_id: str = "",
     virtual_backend: bool = False,
     obo_subject_sha256: str = "",
+    enterprise_employee_id: str = "",
 ) -> str:
     """Mint the per-request /mcp-proxy token in /validate's 200 path.
 
@@ -296,6 +297,8 @@ def mint_mcp_proxy_token(
         extra_claims["audit_identity"] = audit_identity
     if obo_subject_sha256:
         extra_claims["obo_subject_sha256"] = obo_subject_sha256
+    if enterprise_employee_id:
+        extra_claims["enterprise_employee_id"] = enterprise_employee_id
     return _mint_internal_token(
         audience=MCP_PROXY_AUDIENCE,
         subject=subject,

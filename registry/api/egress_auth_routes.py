@@ -44,6 +44,7 @@ from registry.egress_auth.browser_binding import (
     read_browser_secret,
     set_consent_cookie,
 )
+from registry.egress_auth import enterprise
 from registry.egress_auth.factory import get_egress_auth_service
 from registry.egress_auth.providers import list_provider_names, resolve_provider
 from registry.egress_auth.schemas import OAuthState, StoredToken
@@ -880,14 +881,6 @@ async def vend_egress_token(
     claims = verify_mcp_proxy_token(x_internal_token)
     token_upstream = claims.get("upstream_url") or ""
 
-    # Only real per-user principals may vend. The method is canonicalized the way
-    # every registry route canonicalizes it (vault_auth_method, vault_principal).
-    if vault_auth_method(claims) is None:
-        logger.info(
-            "egress vend: non-per-user auth_method %r -> consent", claims.get("auth_method")
-        )
-        return EgressTokenResponse(consent_required=True)
-
     # The proxy passes the registered backend's full path without a leading
     # slash (e.g. "peer/jira"). Preserve every segment so the vault key and
     # upstream allowlist belong to that backend, never its peer prefix.
@@ -900,7 +893,16 @@ async def vend_egress_token(
         return EgressTokenResponse(consent_required=True)
 
     egress_mode = server.get("egress_auth_mode")
-    if egress_mode not in ("oauth_user", "obo_exchange", "pat") or not server.get("egress_oauth"):
+    egress_oauth = server.get("egress_oauth") or {}
+    if egress_mode not in ("oauth_user", "obo_exchange", "pat") or not egress_oauth:
+        return EgressTokenResponse(consent_required=True)
+    provider = egress_oauth.get("provider") or ""
+    is_enterprise = egress_mode == "oauth_user" and provider.startswith(enterprise.PROVIDER_PREFIX)
+    if vault_auth_method(claims) is None:
+        if is_enterprise:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, detail="enterprise credentials require an employee identity"
+            )
         return EgressTokenResponse(consent_required=True)
 
     binding = mcp_proxy_route_binding(claims)
@@ -921,7 +923,6 @@ async def vend_egress_token(
         )
     # The credential must have been approved for this exact destination.
     requested_upstream = approved_url
-    egress_oauth = server["egress_oauth"]
     # Stored tools for a pre-consent tools/list (issue #1986). Built only on the
     # two consent-miss returns below, never for a successful vend.
     direct_route = claims.get("virtual_backend") is False
@@ -970,6 +971,10 @@ async def vend_egress_token(
     # logged.
     principal = vault_principal(claims)
     if principal is None:
+        if is_enterprise:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, detail="enterprise credential subject is unavailable"
+            )
         logger.warning(
             "egress vend: per-user auth_method %r with no egress_user claim for %s "
             "-> consent (refusing to key the vault on the token's username sub)",
@@ -978,6 +983,40 @@ async def vend_egress_token(
         )
         return EgressTokenResponse(consent_required=True)
     auth_method, sub = principal
+
+    if is_enterprise:
+        try:
+            credential = await enterprise.vend(
+                provider, claims.get("enterprise_employee_id") or "", requested_upstream
+            )
+        except enterprise.EnterpriseCredentialDenied as exc:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, detail="enterprise credential access denied"
+            ) from exc
+        except enterprise.EnterpriseCredentialUnavailable as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, detail="enterprise credential temporarily unavailable"
+            ) from exc
+        if credential.token is not None:
+            return EgressTokenResponse(access_token=credential.token)
+        return EgressTokenResponse(
+            consent_required=True,
+            connect_url=credential.authorization_url,
+            provider=provider.removeprefix(enterprise.PROVIDER_PREFIX).upper(),
+            request_state=_build_request_state(
+                user_id=sub,
+                auth_method=auth_method,
+                provider=provider,
+                server_path=server_path,
+                client_id_audit=claims.get("client_id") or "",
+            ),
+            pre_consent_tools=_pre_consent_tool_list(
+                server,
+                selected,
+                direct_route=direct_route,
+                wanted=body.include_pre_consent_tools,
+            ),
+        )
 
     # pat: vend the stored per-user PAT. This branch runs BEFORE oauth_user so a
     # pat server is never routed through svc.get_valid_token (which resolves an
@@ -1236,6 +1275,22 @@ def build_oauth_provider_config(
     return eo
 
 
+@router.get("/egress-auth/enterprise-profiles")
+async def list_enterprise_credential_profiles(
+    user_context: Annotated[dict, Depends(nginx_proxied_auth)],
+) -> list[dict[str, str]]:
+    """List operator-enabled credential profiles without adapter configuration."""
+    _feature_enabled_or_404()
+    _require_admin(user_context)
+    try:
+        profiles = enterprise.credential_profiles()
+    except enterprise.EnterpriseCredentialUnavailable as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, detail="enterprise credential profiles unavailable"
+        ) from exc
+    return [{"value": key, "label": profile.label} for key, profile in profiles.items()]
+
+
 @router.post("/servers/{server_path:path}/egress-auth")
 async def configure_egress_auth(
     request: Request,
@@ -1262,6 +1317,27 @@ async def configure_egress_auth(
     if body.egress_auth_mode == "none":
         server["egress_auth_mode"] = "none"
         server["egress_oauth"] = None
+    elif body.egress_auth_mode == "oauth_user" and body.egress_provider.startswith(
+        enterprise.PROVIDER_PREFIX
+    ):
+        try:
+            profile = enterprise.credential_profiles().get(body.egress_provider)
+            target = selected_upstream(server, False)
+        except enterprise.EnterpriseCredentialUnavailable as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, detail="enterprise credential profiles unavailable"
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, detail="server has no valid upstream"
+            ) from exc
+        if profile is None or target not in profile.upstreams:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail="enterprise credential profile does not allow this server upstream",
+            )
+        server["egress_auth_mode"] = "oauth_user"
+        server["egress_oauth"] = {"provider": body.egress_provider}
     elif body.egress_auth_mode == "oauth_user":
         eo = build_oauth_provider_config(
             provider=body.egress_provider,
@@ -1614,6 +1690,8 @@ async def list_available_egress_servers(
         if not unrestricted and str(path).lstrip("/") not in accessible_norm:
             continue
         eo = server.get("egress_oauth") or {}
+        if str(eo.get("provider") or "").startswith(enterprise.PROVIDER_PREFIX):
+            continue  # WorkBuddy receives an employee-bound link from the tool call.
         results.append(
             {
                 "server_path": path,
