@@ -21,21 +21,22 @@ overrides discovery.
 
 Create the project environment and build the frontend. Run each step with network access to its
 package sources or a populated local cache.
+The deployment commands use the checked-in lockfiles, which record their original dependency cutoff.
 
 ```powershell
 $runtime = Join-Path (Split-Path $PWD -Parent) 'mcp-registry-runtime'
 $env:UV_PROJECT_ENVIRONMENT = Join-Path $runtime 'registry-venv'
-uv sync --locked --no-dev
+uv sync --frozen --no-dev
 npm.cmd --prefix frontend ci
 npm.cmd --prefix frontend run build
 $python = Join-Path $env:UV_PROJECT_ENVIRONMENT 'Scripts/python.exe'
 $env:UV_PROJECT_ENVIRONMENT = Join-Path $runtime 'mcpgw-venv'
-uv sync --project servers/mcpgw --locked --no-dev
+uv sync --project servers/mcpgw --frozen --no-dev
 ```
 
 The upstream lock builds `yara-python` from source when a compatible Windows wheel is unavailable.
 Install the matching Visual C++ build tools to run the security scanner on this host. In a disposable
-loopback test only, `uv sync --locked --no-dev --no-install-package yara-python` can be used with
+loopback test only, `uv sync --frozen --no-dev --no-install-package yara-python` can be used with
 the security scanner disabled.
 
 The second environment is for the WorkBuddy tool server. Skip that environment if you set
