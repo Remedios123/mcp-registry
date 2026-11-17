@@ -81,6 +81,9 @@ that instance's exact host in `GATEWAY_ADDITIONAL_SERVER_NAMES` if you override 
 
 ## Start, inspect, and stop
 
+After configuring `gateway.env`, double-click [start-gateway.bat](start-gateway.bat) in File Explorer
+to start the default instance. If startup fails, the window stays open to show the error.
+
 ```powershell
 & $python -B deploy/windows/gateway.py start --runtime $runtime --instance $instance
 & $python -B deploy/windows/gateway.py status --instance $instance
