@@ -43,6 +43,8 @@ from observability_bootstrap import (
     track_tool,
 )
 from starlette.responses import JSONResponse
+from tool_access import invoke_tool as _invoke_tool_impl
+from tool_access import search_registry_tools as _search_registry_tools_impl
 
 # Issue #1122: start the OTel Prometheus exporter listener so the in-cluster
 # Prometheus can scrape mcpgw on :9464. No-op when
@@ -1567,6 +1569,110 @@ async def healthcheck(ctx: Context | None = None) -> dict[str, Any]:
             "error": str(e),
             "status": "failed",
         }
+
+
+@mcp.tool()
+@track_tool()
+async def search_registry_tools(
+    query: str,
+    max_results: int = 5,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """
+    Search for invocable business tools by capability, scoped to the current
+    user's authorization. Pair it with invoke_tool: search first, then call.
+
+    Use this ALSO as tool discovery: when unsure WHICH tool fits a task, search
+    here first ("find a tool to do X", "有什么工具可以查X", "我该用什么工具",
+    "查询可用的工具", "discover available tools") and invoke what comes back.
+
+    Unlike search_registry (the full catalog discovery tool), this returns ONLY
+    tools the current employee is authorized to use, each with its full
+    inputSchema so the arguments for invoke_tool can be assembled without
+    guessing. Authorization is enforced server-side by the registry.
+
+    Args:
+        query: What capability you need, in natural language (Chinese or English)
+        max_results: Must be 5 (pilot contract; other values are rejected)
+        ctx: Internal request context carrying the employee identity; do not set
+
+    Returns:
+        Dictionary with:
+        - status: "success", "no_match", "auth_failed" (employee identity
+          unavailable) or "registry_error"; an auth failure is never reported
+          as no_match
+        - results: up to 5 candidates, each with server_path (the route key
+          invoke_tool expects), tool_name, description, inputSchema,
+          schema_version, relevance_score and callable. Candidates with
+          callable=false lack a usable schema in the catalog and must not be
+          invoked
+        - total_candidates: how many authorized tool candidates were found
+          before truncation
+
+    no_match means nothing matched within the current authorization scope; it
+    does not prove the capability does not exist. Pass schema_version back to
+    invoke_tool as expected_schema_version so stale-definition calls are
+    refused.
+    """
+    logger.info(f"search_registry_tools called: query length={len(query or '')}")
+    try:
+        return await _search_registry_tools_impl(query, max_results, ctx)
+    except ValueError as e:
+        logger.warning(f"search_registry_tools validation error: {e}")
+        return {"status": "failed", "query": query, "results": [],
+                "error": str(e)}
+
+
+@mcp.tool()
+@track_tool()
+async def invoke_tool(
+    server_path: str,
+    tool_name: str,
+    arguments: dict[str, Any] | None = None,
+    expected_schema_version: str | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """
+    Invoke a business tool on behalf of the current employee. Resolve the
+    target with search_registry_tools first.
+
+    The target is resolved ONLY from the trusted registry catalog:
+    server_path must be a registered route key (e.g. "hr-mcp"), never a URL,
+    and tool_name must be the original tool name. Any URL, token or
+    authentication header supplied as input is rejected. Arguments are
+    validated against the catalog's current inputSchema before execution, and
+    the gateway data plane re-authorizes the call under the employee's own
+    identity.
+
+    Args:
+        server_path: Registered route key from search results (single path
+            segment; this gateway's own entry is rejected)
+        tool_name: Original tool name from search results
+        arguments: Arguments matching the tool's inputSchema
+        expected_schema_version: The schema_version the caller saw when
+            searching. If the definition has changed since, the call is
+            refused and a re-search is required. Omit only when the caller
+            does not know the version (weaker guarantee)
+        ctx: Internal request context carrying the employee identity; do not set
+
+    Returns:
+        Dictionary with status, server_path, tool_name, the tool's content
+        blocks, structured output (when the backend sends one) and the
+        schema_version that was validated.
+
+    Failures are raised as MCP errors with a category prefix: [identity]
+    employee identity unavailable, [permission] no access to the target,
+    [not_found] unknown server/tool, [bad_target] illegal or recursive
+    target, [invalid_arguments] arguments violate the schema,
+    [schema_changed] definition changed since the search,
+    [definition_missing] no usable schema in the catalog,
+    [renewal_required] business token missing or expired (the message carries
+    the /renew entry), [upstream] registry or backend failure, [timeout] the
+    business call timed out (no automatic retry).
+    """
+    logger.info(f"invoke_tool called: server_path={server_path!r} tool={tool_name!r}")
+    return await _invoke_tool_impl(
+        server_path, tool_name, arguments, expected_schema_version, ctx)
 
 
 if __name__ == "__main__":

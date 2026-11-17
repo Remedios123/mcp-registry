@@ -130,6 +130,7 @@ class TestIndexServerKeepsFullTextHash:
     @pytest.mark.asyncio
     async def test_trimmed_entry_is_skipped_when_unchanged(self):
         repo, collection = _repo()
+        repo._sync_tool_docs = AsyncMock(return_value=True)
         server = {
             "server_name": "Big Server",
             "description": "Many tools.",

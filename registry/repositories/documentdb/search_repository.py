@@ -1069,6 +1069,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
 
             if "path_idx" not in index_names:
                 await collection.create_index([("path", 1)], name="path_idx", unique=True)
+                await collection.create_index([("entity_type", 1), ("server_path", 1)])
                 logger.info("Created path index")
 
         except Exception as e:
@@ -1135,7 +1136,9 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                 # Content unchanged and embedding exists; just update is_enabled if needed
                 if existing.get("is_enabled") != is_enabled:
                     await collection.update_one({"_id": path}, {"$set": {"is_enabled": is_enabled}})
-                return True
+                return await self._sync_tool_docs(
+                    collection, path, server_info, is_enabled=is_enabled
+                )
 
         # Flatten metadata into a searchable text field for keyword matching
         metadata_text = flatten_metadata_to_text(metadata)
@@ -1175,10 +1178,81 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         try:
             await collection.replace_one({"_id": path}, doc, upsert=True)
             logger.info(f"Indexed server '{server_info.get('server_name')}' for search")
-            return bool(embedding)
+            indexed_tools = await self._sync_tool_docs(
+                collection, path, server_info, is_enabled=is_enabled
+            )
+            return bool(embedding) and indexed_tools
         except Exception as e:
             logger.error(f"Failed to index server in search: {e}", exc_info=True)
             return False
+
+    async def _sync_tool_docs(
+        self,
+        collection: AsyncIOMotorCollection,
+        path: str,
+        server_info: dict[str, Any],
+        *,
+        is_enabled: bool,
+    ) -> bool:
+        """Store one independently scored document per remote server tool."""
+        import hashlib
+
+        tool_filter = {"entity_type": "mcp_tool", "server_path": path}
+        new_tools = {}
+        if server_info.get("deployment") != "local":
+            for tool in server_info.get("tool_list") or []:
+                name = tool.get("name")
+                if name:
+                    new_tools[f"{path}::{name}"] = tool
+
+        existing = {
+            doc["_id"]: doc
+            for doc in await collection.find(tool_filter).to_list(length=None)
+        }
+        stale_ids = list(existing.keys() - new_tools.keys())
+        if stale_ids:
+            await collection.delete_many({"_id": {"$in": stale_ids}})
+
+        complete = True
+        for tool_id, tool in new_tools.items():
+            name = tool["name"]
+            description = tool.get("description") or ""
+            schema = tool.get("inputSchema")
+            if not isinstance(schema, dict):
+                schema = tool.get("schema")
+
+            embedding_text = EmbeddingText(head=[description, name])
+            text = embedding_text.full()
+            content_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
+            previous = existing.get(tool_id, {})
+            embedding = previous.get("embedding")
+            if previous.get("content_hash") != content_hash or not embedding:
+                embedding = await self._embed_with_trim_retry(
+                    embedding_text, context=f"tool {path}/{name}"
+                )
+
+            doc = {
+                "_id": tool_id,
+                "entity_type": "mcp_tool",
+                "path": tool_id,
+                "server_path": path,
+                "server_name": server_info.get("server_name", ""),
+                "name": name,
+                "description": description,
+                "inputSchema": schema if isinstance(schema, dict) else None,
+                "tags": server_info.get("tags") or [],
+                "is_enabled": is_enabled,
+                "status": server_info.get("status") or "active",
+                "text_for_embedding": text,
+                "content_hash": content_hash,
+                "embedding": embedding,
+                "embedding_metadata": embedding_config.get_embedding_metadata(),
+                "indexed_at": server_info.get("updated_at", server_info.get("registered_at")),
+            }
+            if doc != previous:
+                await collection.replace_one({"_id": tool_id}, doc, upsert=True)
+            complete = complete and bool(embedding)
+        return complete
 
     async def index_agent(
         self,
@@ -1481,6 +1555,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         """Remove a single custom record's embedding (called on record DELETE)."""
         collection = await self._get_collection()
         try:
+            await collection.delete_many({"entity_type": "mcp_tool", "server_path": path})
             result = await collection.delete_one({"_id": path})
             if result.deleted_count > 0:
                 logger.info(f"Removed custom entity '{path}' from search index")
@@ -1809,14 +1884,15 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         embeddings_collection = await self._get_collection()
         indexed_cursor = embeddings_collection.find(
             {},
-            {"_id": 1, "entity_type": 1, "name": 1, "is_enabled": 1},
+            {"_id": 1, "entity_type": 1, "name": 1, "is_enabled": 1, "server_path": 1},
         )
         indexed_docs = await indexed_cursor.to_list(length=None)
 
         stale = []
         for doc in indexed_docs:
             doc_id = doc["_id"]
-            if doc_id not in source_ids:
+            source_id = doc.get("server_path") if doc.get("entity_type") == "mcp_tool" else doc_id
+            if source_id not in source_ids:
                 stale.append(
                     {
                         "path": doc_id,
@@ -2019,11 +2095,8 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             # Build query filter
             query_filter = {}
             if entity_types:
-                # Drop "tool" the way the DocumentDB path does. Tools live inside
-                # their parent server document rather than as standalone entities,
-                # so matching entity_type="tool" can only return nothing. The two
-                # paths disagreed on this before issue #1751: harmless while no
-                # tool documents exist, a divergence the moment any do.
+                # Standalone tools use "mcp_tool". Ignore the embedded "tool"
+                # marker here as the native vector search does.
                 #
                 # An empty list here means the caller asked only for "tool", so
                 # match nothing. Omitting the filter would search every type,
@@ -2046,6 +2119,9 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                 {
                     "_id": 1,
                     "path": 1,
+                    "server_path": 1,
+                    "server_name": 1,
+                    "inputSchema": 1,
                     "entity_type": 1,
                     "name": 1,
                     "description": 1,
@@ -2264,6 +2340,8 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                     result_entry = {
                         "entity_type": "mcp_tool",
                         "path": doc.get("path"),
+                        "server_path": doc.get("server_path"),
+                        "server_name": doc.get("server_name"),
                         "tool_name": doc.get("name"),
                         "description": doc.get("description"),
                         "inputSchema": doc.get("inputSchema", {}),
@@ -2530,6 +2608,8 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                 result_entry = {
                     "entity_type": "mcp_tool",
                     "path": doc.get("path"),
+                    "server_path": doc.get("server_path"),
+                    "server_name": doc.get("server_name"),
                     "tool_name": doc.get("name"),
                     "description": doc.get("description"),
                     "inputSchema": doc.get("inputSchema", {}),
@@ -2573,7 +2653,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         in-memory descriptor cache (never a per-query Mongo read); a stale
         cache only delays a brand-new type by the cache TTL.
         """
-        scope = ["mcp_server", "a2a_agent", "skill", "virtual_server"]
+        scope = ["mcp_server", "mcp_tool", "a2a_agent", "skill", "virtual_server"]
         if not settings.custom_entity_types_enabled:
             return scope
         try:
@@ -2697,8 +2777,8 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             default_scope = await self._default_search_scope()
             search_types = [t for t in (entity_types or default_scope) if t != "tool"]
 
-            # Nothing searchable (for example entity_types=["tool"], which has no
-            # standalone documents). Skip the vector search rather than paying for
+            # Nothing searchable (for example entity_types=["tool"], the marker
+            # for embedded tools). Skip the vector search rather than paying for
             # an ANN traversal whose $match can only reject everything.
             if not search_types:
                 logger.info("No searchable entity types after filtering; skipping vector search")
@@ -3001,6 +3081,8 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                     result_entry = {
                         "entity_type": "mcp_tool",
                         "path": doc.get("path"),
+                        "server_path": doc.get("server_path"),
+                        "server_name": doc.get("server_name"),
                         "tool_name": doc.get("name"),
                         "description": doc.get("description"),
                         "inputSchema": doc.get("inputSchema", {}),

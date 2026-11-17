@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from registry.repositories import stats_repository
 from registry.repositories.stats_repository import (
     _reset_stale_windows,
     get_auth_path_counts,
@@ -495,3 +496,21 @@ class TestGetAuthPathCounts:
 
         assert result["counts"] == {"boto3": 2}
         assert 5.9 < result["window_hours"] < 6.1
+
+
+
+@pytest.mark.asyncio
+async def test_file_stats_serializes_writers_and_recovers_empty_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(stats_repository, "settings", SimpleNamespace(data_dir=tmp_path))
+    (tmp_path / ".stats.json").touch()
+
+    await asyncio.gather(
+        asyncio.to_thread(stats_repository._increment_file),
+        asyncio.to_thread(stats_repository._increment_file),
+    )
+
+    assert stats_repository._get_counts_file() == {
+        "total": 2,
+        "last_24h": 2,
+        "last_1h": 2,
+    }

@@ -1,0 +1,80 @@
+{
+  "personas": {
+    "test-hr": {
+      "token_file": "test-hr.jwt",
+      "deny_servers": [
+        "data-mcp"
+      ]
+    },
+    "test-other": {
+      "token_file": "test-other.jwt",
+      "deny_servers": [
+        "hr-mcp"
+      ]
+    }
+  },
+  "cases": [
+    {
+      "query": "员工 查询 人力",
+      "expect_any": [
+        "search_employees",
+        "get_employee_detail"
+      ]
+    },
+    {
+      "query": "查员工",
+      "expect_any": [
+        "search_employees"
+      ]
+    },
+    {
+      "query": "员工详情",
+      "expect_any": [
+        "get_employee_detail"
+      ]
+    },
+    {
+      "query": "绩效 考核",
+      "expect_any": [
+        "get_performance_detail",
+        "search_performance_records",
+        "search_performance_flow_board"
+      ]
+    },
+    {
+      "query": "绩效考核详情",
+      "expect_any": [
+        "get_performance_detail"
+      ]
+    },
+    {
+      "query": "考核单 查询",
+      "expect_any": [
+        "get_performance_detail",
+        "search_performance_records"
+      ]
+    },
+    {
+      "query": "search_employees",
+      "expect_any": [
+        "search_employees"
+      ]
+    },
+    {
+      "query": "完全无关的查询词组xyzzy",
+      "expect_any": []
+    },
+    {
+      "query": "cursor 资产 用量",
+      "expect_any": [
+        "list_cursor_members",
+        "get_cursor_member_usage",
+        "summarize_cursor_usage"
+      ]
+    },
+    {
+      "query": "天气预报 明天气温",
+      "expect_any": []
+    }
+  ]
+}

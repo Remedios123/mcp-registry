@@ -845,16 +845,6 @@ async def semantic_search(
                 server_path=server_path_for_filter,
             ),
         )
-        matching_tools = [
-            MatchingToolResult(
-                tool_name=tool.get("tool_name") or tool.get("name", ""),
-                description=tool.get("description"),
-                relevance_score=tool["relevance_score"],
-                match_context=tool.get("match_context"),
-            )
-            for tool in allowed_matching
-        ]
-
         # Parse sync_metadata if present
         raw_sync = server.get("sync_metadata")
         sync_meta = SyncMetadata(**raw_sync) if raw_sync else None
@@ -901,6 +891,24 @@ async def semantic_search(
                 server_path=server_path_for_filter,
             ),
         )
+        schemas = {}
+        for tool in allowed_full:
+            schema = tool.get("inputSchema")
+            if not isinstance(schema, dict):
+                schema = tool.get("schema")
+            if isinstance(schema, dict):
+                schemas[tool.get("tool_name") or tool.get("name", "")] = schema
+
+        matching_tools = [
+            MatchingToolResult(
+                tool_name=tool.get("tool_name") or tool.get("name", ""),
+                description=tool.get("description"),
+                relevance_score=tool["relevance_score"],
+                match_context=tool.get("match_context"),
+                inputSchema=schemas.get(tool.get("tool_name") or tool.get("name", "")),
+            )
+            for tool in allowed_matching
+        ]
         filtered_num_tools = len(allowed_full)
 
         # Strip the raw internal backend URLs for non-admins in with-gateway
@@ -961,7 +969,9 @@ async def semantic_search(
     for tool in raw_results.get("tools", []):
         server_path = tool.get("server_path", "")
         server_name = tool.get("server_name", "")
-        if not await _user_can_access_server(server_path, server_name, user_context):
+        if not server_path or not await _user_can_access_server(
+            server_path, server_name, user_context
+        ):
             continue
 
         # A security-blocked tool must not appear in search. intelligent_tool_finder

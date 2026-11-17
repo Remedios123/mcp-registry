@@ -1,0 +1,253 @@
+{
+  "personas": {
+    "test-hr": {
+      "token_file": "test-hr.jwt",
+      "deny_servers": [
+        "data-mcp"
+      ],
+      "cases": [
+        {
+          "query": "查员工",
+          "expect_any": [
+            "search_employees"
+          ]
+        },
+        {
+          "query": "员工 查询 人力",
+          "expect_any": [
+            "search_employees",
+            "get_employee_detail"
+          ]
+        },
+        {
+          "query": "员工详情",
+          "expect_any": [
+            "get_employee_detail"
+          ]
+        },
+        {
+          "query": "search_employees",
+          "expect_any": [
+            "search_employees"
+          ]
+        },
+        {
+          "query": "帮我找个同事的联系方式",
+          "expect_any": [
+            "search_employees"
+          ]
+        },
+        {
+          "query": "部门花名册",
+          "expect_any": [
+            "search_employees"
+          ]
+        },
+        {
+          "query": "在职员工有哪些",
+          "expect_any": [
+            "search_employees"
+          ]
+        },
+        {
+          "query": "看一下某位员工的详细资料",
+          "expect_any": [
+            "get_employee_detail"
+          ]
+        },
+        {
+          "query": "员工个人信息查询",
+          "expect_any": [
+            "get_employee_detail",
+            "search_employees"
+          ]
+        },
+        {
+          "query": "绩效 考核",
+          "expect_any": [
+            "get_performance_detail",
+            "search_performance_records",
+            "search_performance_flow_board"
+          ]
+        },
+        {
+          "query": "绩效考核详情",
+          "expect_any": [
+            "get_performance_detail"
+          ]
+        },
+        {
+          "query": "考核单 查询",
+          "expect_any": [
+            "get_performance_detail",
+            "search_performance_records"
+          ]
+        },
+        {
+          "query": "上季度绩效考核结果",
+          "expect_any": [
+            "search_performance_records",
+            "get_performance_detail"
+          ]
+        },
+        {
+          "query": "考核打分记录",
+          "expect_any": [
+            "search_performance_records"
+          ]
+        },
+        {
+          "query": "团队绩效排名",
+          "expect_any": [
+            "search_performance_flow_board"
+          ]
+        },
+        {
+          "query": "绩效流程进行到哪一步了",
+          "expect_any": [
+            "search_performance_flow_board"
+          ]
+        },
+        {
+          "query": "有什么工具可以查员工",
+          "expect_any": [
+            "search_registry_tools"
+          ]
+        },
+        {
+          "query": "invoke_tool",
+          "expect_any": [
+            "invoke_tool"
+          ]
+        },
+        {
+          "query": "cursor 用量统计",
+          "expect_any": []
+        },
+        {
+          "query": "aws 成本账单",
+          "expect_any": []
+        },
+        {
+          "query": "腾讯云服务器列表",
+          "expect_any": []
+        },
+        {
+          "query": "完全无关的查询词组xyzzy",
+          "expect_any": []
+        },
+        {
+          "query": "天气预报 明天气温",
+          "expect_any": []
+        },
+        {
+          "query": "红烧肉怎么做",
+          "expect_any": []
+        },
+        {
+          "query": "今天股市行情",
+          "expect_any": []
+        }
+      ]
+    },
+    "test-other": {
+      "token_file": "test-other.jwt",
+      "deny_servers": [
+        "hr-mcp"
+      ],
+      "cases": [
+        {
+          "query": "cursor 成员列表",
+          "expect_any": [
+            "list_cursor_members"
+          ]
+        },
+        {
+          "query": "谁在用 cursor",
+          "expect_any": [
+            "list_cursor_members"
+          ]
+        },
+        {
+          "query": "cursor 用量统计",
+          "expect_any": [
+            "get_cursor_member_usage",
+            "summarize_cursor_usage"
+          ]
+        },
+        {
+          "query": "cursor 消费汇总",
+          "expect_any": [
+            "summarize_cursor_usage"
+          ]
+        },
+        {
+          "query": "cursor 成本排名",
+          "expect_any": [
+            "rank_cursor_on_demand_cost"
+          ]
+        },
+        {
+          "query": "用量快照",
+          "expect_any": [
+            "list_cursor_usage_snapshots"
+          ]
+        },
+        {
+          "query": "aws 成本查询",
+          "expect_any": [
+            "query_aws_costs"
+          ]
+        },
+        {
+          "query": "云上花了多少钱",
+          "expect_any": [
+            "query_aws_costs"
+          ]
+        },
+        {
+          "query": "我们团队订阅了哪些账号",
+          "expect_any": [
+            "list_cursor_members"
+          ]
+        },
+        {
+          "query": "这个月编程工具的开销",
+          "expect_any": [
+            "query_aws_costs",
+            "summarize_cursor_usage",
+            "get_cursor_member_usage"
+          ]
+        },
+        {
+          "query": "有什么工具可以查云成本",
+          "expect_any": [
+            "search_registry_tools"
+          ]
+        },
+        {
+          "query": "invoke_tool",
+          "expect_any": [
+            "invoke_tool"
+          ]
+        },
+        {
+          "query": "查员工",
+          "expect_any": []
+        },
+        {
+          "query": "绩效考核详情",
+          "expect_any": []
+        },
+        {
+          "query": "完全无关的查询词组xyzzy",
+          "expect_any": []
+        },
+        {
+          "query": "天气预报 明天气温",
+          "expect_any": []
+        }
+      ]
+    }
+  }
+}

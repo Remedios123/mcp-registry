@@ -10,14 +10,19 @@ Primary storage is the mcp_stats_{namespace} MongoDB collection.
 Falls back to a local JSON file ({data_dir}/.stats.json) on error.
 """
 
-import fcntl
 import json
 import logging
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from ..core.config import settings
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 logger = logging.getLogger(__name__)
 
@@ -263,9 +268,15 @@ def _get_stats_file() -> Path:
 
 def _read_file_stats() -> dict:
     """Read stats from file."""
-    stats_file = _get_stats_file()
-    if stats_file.exists():
-        return json.loads(stats_file.read_text())
+    try:
+        content = _get_stats_file().read_text()
+    except FileNotFoundError:
+        return _empty_file_stats()
+    return json.loads(content) if content.strip() else _empty_file_stats()
+
+
+def _empty_file_stats() -> dict:
+    """Initialize counters for an empty stats file."""
     return {
         "hourly": {"semantic_search_ctr": 0},
         "daily": {"semantic_search_ctr": 0},
@@ -285,19 +296,22 @@ def _write_file_stats(stats: dict) -> None:
 def _increment_file() -> None:
     """Increment counter in file-based storage with staleness reset.
 
-    Uses file locking (fcntl.flock) to prevent lost updates from
-    concurrent processes.
+    The file lock prevents concurrent writers from losing increments.
     """
     stats_file = _get_stats_file()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
 
     # Open file for read+write, create if missing
     with open(stats_file, "a+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+        if os.name == "nt":
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(f, fcntl.LOCK_EX)
         try:
             f.seek(0)
             content = f.read()
-            stats = json.loads(content) if content.strip() else _read_file_stats()
+            stats = json.loads(content) if content.strip() else _empty_file_stats()
 
             now = datetime.now(UTC)
 
@@ -335,8 +349,13 @@ def _increment_file() -> None:
             f.seek(0)
             f.truncate()
             f.write(json.dumps(stats, default=str))
+            f.flush()
         finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+            if os.name == "nt":
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def _get_count_file() -> int:
