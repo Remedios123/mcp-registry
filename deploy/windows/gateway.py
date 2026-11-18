@@ -18,6 +18,13 @@ from dotenv import dotenv_values
 import httpx
 import psutil
 
+from local_mongo_auth import (
+    ADMIN_PASSWORD,
+    APP_PASSWORD,
+    bootstrap_managed_mongo,
+    configure_managed_mongo_auth,
+    shutdown_managed_mongo,
+)
 from nginx_bridge import nginx_command, prepare_nginx
 
 
@@ -60,12 +67,16 @@ def _executable(runtime: Path, env: dict[str, str], key: str, folder: str, name:
     raise ValueError(f"Set {key} to the full path to {name}.")
 
 
+def _load_instance_env(config: Path) -> dict[str, str]:
+    values = dotenv_values(config, interpolate=False) if config.is_file() else {}
+    return {**{key: value for key, value in values.items() if value is not None}, **os.environ}
+
+
 def _configuration(args: argparse.Namespace) -> tuple[dict[str, str], dict[str, int]]:
     config = args.config or args.instance / "gateway.env"
     if not config.is_file():
         raise ValueError(f"Copy gateway.env.example to {config} and configure it.")
-    env = {**{key: value for key, value in dotenv_values(config, interpolate=False).items()
-              if value is not None}, **os.environ}
+    env = _load_instance_env(config)
     ports = {name: int(env.get(f"WINDOWS_{name}_PORT", port))
              for name, port in DEFAULT_PORTS.items()}
     if any(not 1 <= port <= 65535 for port in ports.values()) or len(set(ports.values())) != len(ports):
@@ -258,12 +269,16 @@ def _register_local_cas(instance: Path, env: dict[str, str]) -> None:
         raise ValueError("WINDOWS_CAS_SIGNUP_MODE must be open or whitelist.")
     log = instance / "logs/keycloak-cas-setup.log"
     script = REPO / "keycloak/setup/configure-cas.py"
+    steps = [["configure", "--signup-mode", signup, "--if-missing"]]
+    if signup == "whitelist" and (employee := env.get("WINDOWS_CAS_INITIAL_EMPLOYEE")):
+        steps.append(["bind", employee, employee])
     try:
         with log.open("a", encoding="utf-8") as output:
-            subprocess.run(
-                [sys.executable, "-B", str(script), "configure", "--signup-mode", signup, "--if-missing"],
-                env=env, cwd=REPO, stdout=output, stderr=subprocess.STDOUT, check=True, timeout=90,
-            )
+            for step in steps:
+                subprocess.run(
+                    [sys.executable, "-B", str(script), *step],
+                    env=env, cwd=REPO, stdout=output, stderr=subprocess.STDOUT, check=True, timeout=90,
+                )
     except subprocess.SubprocessError as exc:
         raise RuntimeError(f"Could not configure the local CAS identity provider. See {log}.") from exc
 
@@ -286,9 +301,15 @@ def _commands(
         env.update(DOCUMENTDB_HOST="127.0.0.1", DOCUMENTDB_PORT=str(port), DOCUMENTDB_DATABASE=database,
                    DOCUMENTDB_USE_TLS="false", DOCUMENTDB_DIRECT_CONNECTION="true",
                    MONGODB_CONNECTION_STRING=f"mongodb://127.0.0.1:{port}/{database}?directConnection=true")
-        commands.append(("mongodb", [str(mongo), "--dbpath", str(db_path), "--port", str(port),
-                                     "--bind_ip", "127.0.0.1"], port))
-        env.setdefault("SHIM_MONGO_URI", f"mongodb://127.0.0.1:{port}/?directConnection=true")
+        mongo_command = [str(mongo), "--dbpath", str(db_path), "--port", str(port),
+                         "--bind_ip", "127.0.0.1"]
+        real_cas = _enabled(env, "WINDOWS_MANAGE_CAS_SHIM") and not _enabled(env, "CAS_SHIM_MOCK")
+        if real_cas or env.get(ADMIN_PASSWORD) or env.get(APP_PASSWORD):
+            configure_managed_mongo_auth(env, port)
+            mongo_command.append("--auth")
+        else:
+            env.setdefault("SHIM_MONGO_URI", f"mongodb://127.0.0.1:{port}/?directConnection=true")
+        commands.append(("mongodb", mongo_command, port))
     if _enabled(env, "WINDOWS_MANAGE_KEYCLOAK"):
         port = ports["KEYCLOAK"]
         launcher = _keycloak_setup(args, env, port)
@@ -303,8 +324,6 @@ def _commands(
         _require_env(env, {"SHIM_CLIENT_SECRET": 32, "SHIM_SIGNING_SECRET": 32, "SHIM_INTERNAL_TOKEN": 32})
         if not _enabled(env, "CAS_SHIM_MOCK"):
             _require_env(env, {"CAS_BASE": 1, "UC_AUTH_URL": 1})
-            if _enabled(env, "WINDOWS_MANAGE_MONGO"):
-                raise ValueError("Real CAS and UC require authenticated MongoDB. Set WINDOWS_MANAGE_MONGO=false.")
             _require_env(env, {"SHIM_MONGO_URI": 1})
         env.setdefault("SHIM_BASE_URL", _endpoint(port))
         env.setdefault("SHIM_SIGNING_KEY_PATH", str(args.instance / "shim-signing-key.pem"))
@@ -432,7 +451,7 @@ def _bootstrap_database(instance: Path, env: dict[str, str]) -> None:
     pending.unlink()
 
 
-def _shutdown(name: str, entry: dict) -> None:
+def _shutdown(name: str, entry: dict, env: dict[str, str]) -> None:
     process = _live(entry)
     if process is None:
         return
@@ -443,20 +462,15 @@ def _shutdown(name: str, entry: dict) -> None:
                            stderr=subprocess.DEVNULL, timeout=10, check=False)
         except (OSError, subprocess.TimeoutExpired):
             pass
+    secured_mongo = name == "mongodb" and "--auth" in entry["command"]
     if name == "mongodb":
-        from pymongo import MongoClient
-        from pymongo.errors import PyMongoError
-
-        try:
-            with MongoClient("127.0.0.1", entry["target"], directConnection=True,
-                             timeoutMS=3000) as client:
-                client.admin.command("shutdown")
-        except PyMongoError:
-            pass
+        shutdown_managed_mongo(entry["target"], secured_mongo, env)
     if name in {"nginx", "mongodb"}:
         _, alive = psutil.wait_procs([process, *children], timeout=10)
     else:
         alive = [process, *children]
+    if secured_mongo and alive:
+        raise RuntimeError("Authenticated MongoDB is still running after the shutdown request.")
     for running in reversed(alive):
         try:
             running.terminate()
@@ -513,6 +527,8 @@ def _start(args: argparse.Namespace, state_path: Path, state: dict) -> None:
             _write_state(state_path, state)
             _wait_ready(name, proc, target, log)
             if name == "mongodb":
+                if "--auth" in command:
+                    bootstrap_managed_mongo(env)
                 _bootstrap_database(args.instance, env)
             elif name == "keycloak":
                 _configure_keycloak_web(args.instance, env)
@@ -520,18 +536,18 @@ def _start(args: argparse.Namespace, state_path: Path, state: dict) -> None:
                 _register_local_cas(args.instance, env)
     except BaseException:
         try:
-            _stop(state_path, state)
+            _stop(state_path, state, env)
         except RuntimeError as exc:
             print(f"Startup rollback: {exc}", file=sys.stderr)
         raise
     print(f"Gateway listening on {_endpoint(ports['GATEWAY'])}. Public URL {env['REGISTRY_URL']}.")
 
 
-def _stop(state_path: Path, state: dict) -> None:
+def _stop(state_path: Path, state: dict, env: dict[str, str]) -> None:
     failures = []
     for name, entry in reversed(list(state.items())):
         try:
-            _shutdown(name, entry)
+            _shutdown(name, entry, env)
         except (OSError, RuntimeError, psutil.Error) as exc:
             failures.append(f"{name}: {exc}")
             continue
@@ -576,7 +592,8 @@ def main() -> int:
             if args.action == "start":
                 _start(args, state_path, state)
             else:
-                _stop(state_path, state)
+                config = args.config or args.instance / "gateway.env"
+                _stop(state_path, state, _load_instance_env(config))
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, psutil.Error) as exc:
         print(f"{exc} Logs: {args.instance / 'logs'}", file=sys.stderr)
         return 1

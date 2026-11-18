@@ -25,8 +25,9 @@ UC 令牌由服务端使用。
   标准 OAuth 提供方继续使用上游配置。
 - Keycloak 的用户名采用工号并沿用 realm 的大小写规则。CAS 联邦 ID 和受保护
   员工声明保留签发方的原始工号。预绑定只复用工号匹配的员工账号。
-  部署时使用实际 CAS/UC 地址、精确 Keycloak 回调 URI 和组织 CA。
-  UC 令牌加密保存，真实 UC 要求认证的 MongoDB。旧明文 vault 的临时迁移开关
+  部署时登记实际 CAS/UC 地址与精确回调 URI。证书需要私有 CA 时配置 PEM。
+  [setup-cas.bat](deploy/windows/setup-cas.bat) 支持 Windows 首次配置、预绑定工号和
+  初始化本机 MongoDB 认证。UC 令牌加密保存。旧明文 vault 的临时迁移开关
   见 [CAS shim 操作说明](cas-shim/README.md)。
 - 可选同源模式使用 MCP_OAUTH_AS_ON_GATEWAY_REALM=true。将
   KEYCLOAK_EXTERNAL_URL 和 Keycloak 的 KC_HOSTNAME 设置为与 REGISTRY_URL
@@ -38,6 +39,10 @@ UC 令牌由服务端使用。
 
 ## 验证记录
 
+- 双击配置在全新实例和含空格、中文的路径下通过，重复运行保留密钥。
+  在新的 Windows 实例中验证七个本机服务就绪、自动登记 CAS broker、
+  首个工号无邮箱预绑定、MongoDB 拒绝匿名读取及正常停止。
+  单独验证无认证的旧本机数据库启用认证后原数据保留。测试使用占位 CAS/UC 地址。
 - 在原生 Windows、Python 3.14、Keycloak 25、MongoDB 8.2 和 OpenResty 上跑通干净
   上游。管理页和登录重定向通过，临时测试 MCP 注册、启用和原生代理调用分别
   返回 201、200 和 200。Nginx 配置检查和重载通过。

@@ -46,6 +46,9 @@ model source. The first registration may reach the proxy timeout while the model
 
 ## Configure a local instance
 
+For company CAS, use the [one-time CAS setup](#company-cas-and-mcp-adapters) below. For a
+username/password-only Windows instance, configure the file manually.
+
 ```powershell
 $instance = Join-Path $runtime 'gateway'
 New-Item -ItemType Directory -Path $instance -Force | Out-Null
@@ -68,8 +71,8 @@ The example uses local Keycloak development mode and loopback MongoDB. The launc
 upstream MongoDB initializer for a fresh local database, including the Keycloak group-to-scope
 mappings required to register servers.
 
-The managed loopback MongoDB is for local smoke testing. For real UC, set
-`WINDOWS_MANAGE_MONGO=false` and point `SHIM_MONGO_URI` at an authenticated database.
+The CAS setup creates the credentials for the managed loopback MongoDB and enables authentication.
+The data directory and credentials persist across launches.
 
 For a shared deployment,
 set `WINDOWS_MANAGE_KEYCLOAK=false` and `WINDOWS_MANAGE_MONGO=false`, and configure the existing
@@ -114,15 +117,49 @@ enabled and use explicit values if you set `MCPGW_HTTP_ALLOWED_HOSTS`.
 
 ## Company CAS and MCP adapters
 
-Use the **Company CAS and UC** section in [gateway.env.example](gateway.env.example) as a
-reference for the instance's `gateway.env`. Set `WINDOWS_MANAGE_CAS_SHIM=true` and fill the CAS and
-UC URLs, TLS trust, and three shim secrets. The launcher stores the shim's generated signing key in the instance. On a deployment with
-company data, use an authenticated MongoDB deployment and set `SHIM_MONGO_URI` to the shim's
-own database connection. For example, use
-`mongodb://SHIM_USER:PASSWORD@mongo.company.example:27017/cas_shim?authSource=admin&tls=true`.
-URL-encode credentials that contain special characters. Set the registry's authenticated
-`MONGODB_CONNECTION_STRING` separately. Managed local MongoDB is for loopback development and
-mock CAS tests.
+1. Finish [runtime preparation](#prepare-the-runtime) and double-click [setup-cas.bat](setup-cas.bat).
+   Press Enter at the old file prompt to enter the current CAS base URL and UC ticket exchange
+   URL yourself. Supply the UC refresh URL if available. The old file prompt also accepts a
+   path to a previous shim's `.env` to prefill the endpoint settings. Enter the first employee's
+   actual CAS/UC employee ID to bind that account when starting locally managed Keycloak in
+   whitelist mode.
+2. The installer creates or updates `mcp-registry-runtime/gateway/gateway.env` alongside the
+   checkout. It generates any missing gateway, shim, and managed service secrets. Keep the file
+   private and retain it with the instance data. Set `CAS_CA_BUNDLE` in this file if your CAS
+   or UC HTTPS certificates require a PEM bundle trusted by the shim.
+3. Ask the CAS administrator to allow the exact shim callback as a CAS service. For the default
+   ports and a browser on the gateway machine, that callback is
+   `http://127.0.0.1:8085/cas/callback`. For a browser on another computer, follow the
+   [public HTTPS configuration](#browsers-accessing-the-gateway-from-another-computer).
+4. To enable HR calls, start the HR adapter and add the following settings to `gateway.env`
+   before starting the gateway. Replace the example URL in `upstreams` with the exact HR MCP
+   URL you will register. For a loopback HTTP adapter, also set `SSRF_ALLOWED_CIDRS=127.0.0.1/32`
+   and `MCP_HTTPS_REQUIRED=false`.
+
+   ```dotenv
+   EGRESS_AUTH_ENABLED=true
+   ENTERPRISE_CREDENTIAL_PROFILES=[{"id":"uc","label":"UC","issuer":"uc","upstreams":["http://127.0.0.1:8000/mcp"]}]
+   ```
+
+5. If the gateway is already running, double-click [stop-gateway.bat](stop-gateway.bat) once,
+   then double-click [start-gateway.bat](start-gateway.bat). On the default local instance open
+   `http://127.0.0.1:17860/`, select **Continue with Keycloak**, then **企业内部登录**.
+   The CAS account uses its employee ID without email or name.
+6. In the Registry, register or edit HR, choose UC under
+   **Egress Auth → Per-user OAuth → Enterprise credentials**, and grant its tools and the
+   Registry Tools entry point to the relevant employee group. WorkBuddy connects to
+   `http://127.0.0.1:17860/airegistry-tools/mcp` on the default local instance.
+
+On later launches use the same `gateway.env`. Enable external MongoDB by setting
+`WINDOWS_MANAGE_MONGO=false`, with authenticated `MONGODB_CONNECTION_STRING` and
+`SHIM_MONGO_URI` for the Registry and shim databases. URL-encode special characters in URI
+credentials. The local Keycloak administrative password is saved as `KEYCLOAK_ADMIN_PASSWORD`.
+The Registry administrator is a realm user in `mcp-registry-admin` as described above.
+
+When switching from UAT to production, update `CAS_BASE`, `UC_AUTH_URL` and `UC_REFRESH_URL`
+in the instance configuration, and restart. Verify the callback registration on the new CAS
+and complete UC authorization against the production issuer.
+
 The shim's access logger is disabled because CAS callbacks can carry tickets in their query
 strings. Configure the front proxy's shim access logs to omit query strings as well.
 
