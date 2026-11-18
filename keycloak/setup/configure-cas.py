@@ -235,12 +235,18 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     setup = commands.add_parser("configure")
     setup.add_argument("--signup-mode", choices=("open", "whitelist"), default="whitelist")
+    setup.add_argument("--if-missing", action="store_true", help="Create the CAS provider only when absent.")
     bind = commands.add_parser("bind")
     bind.add_argument("employee_id")
     bind.add_argument("display_name")
     options = parser.parse_args()
     api = AdminAPI()
     if options.command == "configure":
+        if options.if_missing and any(
+            item["alias"] == "cas" for item in api.call("GET", "/identity-provider/instances")
+        ):
+            print("CAS identity provider already configured.")
+            return
         _configure_broker(api, options.signup_mode)
         _configure_realm_defaults(api)
         configure(api)

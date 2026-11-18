@@ -61,8 +61,8 @@ username, which defaults to `admin`, and `KEYCLOAK_ADMIN_PASSWORD`. Create a rea
 them in `mcp-registry-admin` to administer the registry. Changing the client secret, public origin,
 or initial Keycloak administrative password on an existing instance also requires updating that
 setting in Keycloak.
-For locally managed Keycloak, startup restores the standard email and profile scopes on the web
-client when Keycloak rejects them during login.
+For locally managed Keycloak, startup restores the standard email and profile scopes when
+Keycloak rejects them. The realm accepts username/password sign-in with a blank email and name.
 
 The example uses local Keycloak development mode and loopback MongoDB. The launcher runs the
 upstream MongoDB initializer for a fresh local database, including the Keycloak group-to-scope
@@ -126,7 +126,13 @@ mock CAS tests.
 The shim's access logger is disabled because CAS callbacks can carry tickets in their query
 strings. Configure the front proxy's shim access logs to omit query strings as well.
 
-From a shell with `KEYCLOAK_ADMIN_URL`, `KEYCLOAK_ADMIN_PASSWORD`, `SHIM_BASE_URL`,
+When the launcher manages both Keycloak and the shim, it registers the CAS identity provider
+on first start. On the Registry login page, choose **Continue with Keycloak**, then
+**企业内部登录** on the Keycloak page. Use `WINDOWS_CAS_SIGNUP_MODE=open` to allow automatic
+account creation when registering a new provider. The default is `whitelist`.
+
+For a separately managed Keycloak, configure the broker manually. From a shell with
+`KEYCLOAK_ADMIN_URL`, `KEYCLOAK_ADMIN_PASSWORD`, `SHIM_BASE_URL`,
 `SHIM_PUBLIC_URL`, and `SHIM_CLIENT_SECRET` set, configure the Keycloak broker. Use the
 same issuer and client credentials configured on the shim. With whitelist signup, bind
 each employee before their first sign-in.

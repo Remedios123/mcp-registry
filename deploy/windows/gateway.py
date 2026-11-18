@@ -120,6 +120,7 @@ def _keycloak_setup(args: argparse.Namespace, env: dict[str, str], port: int) ->
                         dirs_exist_ok=True)
     keycloak_url = _endpoint(port)
     env.update(JAVA_HOME=str(java.parent.parent), KEYCLOAK_URL=keycloak_url,
+               KEYCLOAK_ADMIN_URL=keycloak_url,
                KEYCLOAK_EXTERNAL_URL=keycloak_url, KEYCLOAK_REALM="mcp-gateway",
                KEYCLOAK_CLIENT_ID="mcp-gateway-web")
     env.setdefault("KEYCLOAK_ADMIN", "admin")
@@ -156,8 +157,9 @@ def _prepare_realm(home: Path, env: dict[str, str]) -> None:
     target.write_text(json.dumps(realm), encoding="utf-8")
 
 
-def _repair_keycloak_web_scopes(env: dict[str, str]) -> None:
-    """Restore the standard web scopes omitted by an old realm import."""
+def _configure_keycloak_web(instance: Path, env: dict[str, str]) -> None:
+    """Prepare the locally managed realm for username/password web sign-in."""
+    profile_ready = instance / "keycloak-web-profile.configured"
     realm = env["KEYCLOAK_REALM"]
     web_client = env["KEYCLOAK_CLIENT_ID"]
     token_path = "/realms/master/protocol/openid-connect/token"
@@ -173,7 +175,8 @@ def _repair_keycloak_web_scopes(env: dict[str, str]) -> None:
     with httpx.Client(base_url=env["KEYCLOAK_URL"], trust_env=False, timeout=15) as client:
         probe = client.get(authorize_path, params=authorize_params)
         location = urlsplit(probe.headers.get("location", ""))
-        if parse_qs(location.query).get("error") != ["invalid_scope"]:
+        needs_scopes = parse_qs(location.query).get("error") == ["invalid_scope"]
+        if not needs_scopes and profile_ready.is_file():
             return
         try:
             token = client.post(token_path, data={
@@ -182,10 +185,13 @@ def _repair_keycloak_web_scopes(env: dict[str, str]) -> None:
                 "username": env["KEYCLOAK_ADMIN"],
                 "password": env["KEYCLOAK_ADMIN_PASSWORD"],
             }).raise_for_status().json()["access_token"]
-            _restore_keycloak_web_scopes(client, realm, web_client, token)
+            if needs_scopes:
+                _restore_keycloak_web_scopes(client, realm, web_client, token)
+            _make_keycloak_profile_optional(client, realm, token)
         except httpx.HTTPError as exc:
-            raise RuntimeError(f"Could not restore local Keycloak web scopes: {exc}") from exc
-    print("Keycloak web sign-in scopes restored.")
+            raise RuntimeError(f"Could not configure local Keycloak web sign-in: {exc}") from exc
+    profile_ready.touch()
+    print("Local Keycloak web sign-in configured.")
 
 
 def _restore_keycloak_web_scopes(
@@ -224,6 +230,42 @@ def _restore_keycloak_web_scopes(
     assigned = {scope["id"] for scope in default + optional}
     for scope_id in sorted(set(selected.values()) - assigned):
         client.put(f"{default_path}/{scope_id}", headers=headers).raise_for_status()
+
+
+def _make_keycloak_profile_optional(client: httpx.Client, realm: str, token: str) -> None:
+    headers = {"Authorization": f"Bearer {token}"}
+    realm_api = f"/admin/realms/{realm}"
+    profile_url = f"{realm_api}/users/profile"
+    profile = client.get(profile_url, headers=headers).raise_for_status().json()
+    required = [attribute for attribute in profile["attributes"]
+                if attribute["name"] in {"email", "firstName", "lastName"} and "required" in attribute]
+    if required:
+        for attribute in required:
+            del attribute["required"]
+        client.put(profile_url, headers=headers, json=profile).raise_for_status()
+    actions_url = f"{realm_api}/authentication/required-actions"
+    actions = client.get(actions_url, headers=headers).raise_for_status().json()
+    verify = next((action for action in actions if action["alias"] == "VERIFY_PROFILE"), None)
+    if verify and (verify.get("enabled") or verify.get("defaultAction")):
+        client.put(f"{actions_url}/VERIFY_PROFILE", headers=headers, json={
+            **verify, "enabled": False, "defaultAction": False,
+        }).raise_for_status()
+
+
+def _register_local_cas(instance: Path, env: dict[str, str]) -> None:
+    signup = env.get("WINDOWS_CAS_SIGNUP_MODE", "whitelist")
+    if signup not in {"open", "whitelist"}:
+        raise ValueError("WINDOWS_CAS_SIGNUP_MODE must be open or whitelist.")
+    log = instance / "logs/keycloak-cas-setup.log"
+    script = REPO / "keycloak/setup/configure-cas.py"
+    try:
+        with log.open("a", encoding="utf-8") as output:
+            subprocess.run(
+                [sys.executable, "-B", str(script), "configure", "--signup-mode", signup, "--if-missing"],
+                env=env, cwd=REPO, stdout=output, stderr=subprocess.STDOUT, check=True, timeout=90,
+            )
+    except subprocess.SubprocessError as exc:
+        raise RuntimeError(f"Could not configure the local CAS identity provider. See {log}.") from exc
 
 
 def _uvicorn(app: str, port: int, *options: str) -> list[str]:
@@ -473,7 +515,9 @@ def _start(args: argparse.Namespace, state_path: Path, state: dict) -> None:
             if name == "mongodb":
                 _bootstrap_database(args.instance, env)
             elif name == "keycloak":
-                _repair_keycloak_web_scopes(env)
+                _configure_keycloak_web(args.instance, env)
+            elif name == "cas-shim" and _enabled(env, "WINDOWS_MANAGE_KEYCLOAK"):
+                _register_local_cas(args.instance, env)
     except BaseException:
         try:
             _stop(state_path, state)
