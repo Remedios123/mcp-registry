@@ -73,6 +73,14 @@ def _windows_config(
         "/usr/share/nginx/html": prefix / "html",
     }.items():
         content = _relocate_paths(content, source, target)
+    # Registry auth routes construct their external URLs from the validated
+    # Host header. $host removes the port of the native Windows listener.
+    content = re.sub(
+        r"(location \^~ [^\s{]*/api/auth \{[^}]*?proxy_set_header Host )\$host;",
+        r"\1$http_host;",
+        content,
+        count=1,
+    )
     return content
 
 
