@@ -114,9 +114,9 @@ enabled and use explicit values if you set `MCPGW_HTTP_ALLOWED_HOSTS`.
 
 ## Company CAS and MCP adapters
 
-Set `WINDOWS_MANAGE_CAS_SHIM=true` and review `cas-shim/.env.example`. Supply the company CAS and
-user-center URLs, TLS trust, browser callback, shim client secret, signing secret, and internal
-token. The launcher stores the shim's generated signing key in the instance. On a deployment with
+Use the **Company CAS and UC** section in [gateway.env.example](gateway.env.example) as a
+reference for the instance's `gateway.env`. Set `WINDOWS_MANAGE_CAS_SHIM=true` and fill the CAS and
+UC URLs, TLS trust, and three shim secrets. The launcher stores the shim's generated signing key in the instance. On a deployment with
 company data, use an authenticated MongoDB deployment and set `SHIM_MONGO_URI` to the shim's
 own database connection. For example, use
 `mongodb://SHIM_USER:PASSWORD@mongo.company.example:27017/cas_shim?authSource=admin&tls=true`.
@@ -148,6 +148,26 @@ the shim's CAS callback in the CAS service configuration. Configure
 business credential. The launcher defaults the registry's `ENTERPRISE_CREDENTIAL_SHIM_URL` to the
 local shim listener and its browser URL to `SHIM_PUBLIC_URL` or `SHIM_BASE_URL`. Expose only the
 browser and OIDC endpoints required by the CAS and Keycloak flow through the HTTPS front proxy.
+
+### Browsers accessing the gateway from another computer
+
+Give users the gateway HTTPS URL. A loopback browser URL points at the computer running the browser.
+For example, route `https://gateway.company.example` to the gateway's loopback listener on port
+17860, `https://sso.company.example` to Keycloak, and `https://cas-shim.company.example` to the shim's
+browser endpoints `/authorize`, `/cas/callback`, and `/renew`. Keep the shim's `/internal/` endpoints
+on the private listener. The reverse proxy preserves the original Host and sets trusted HTTPS
+forwarding headers.
+
+Set `REGISTRY_URL`, `KEYCLOAK_EXTERNAL_URL`, `SHIM_PUBLIC_URL`, and `SHIM_CALLBACK_URL` to those public
+origins and callback. Set `SHIM_ALLOWED_REDIRECT_URIS` to the exact public Keycloak broker callback.
+On the same server, `KEYCLOAK_URL` and `SHIM_BASE_URL` can use the private loopback listeners. The
+Windows-managed Keycloak uses a loopback browser hostname. For the HTTPS hostname above, set
+`WINDOWS_MANAGE_KEYCLOAK=false` and run Keycloak with `KC_HOSTNAME=https://sso.company.example`,
+`KC_PROXY_HEADERS=xforwarded`, and `KC_HTTP_ENABLED=true` behind a TLS-terminating proxy. Register
+`https://gateway.company.example/oauth2/callback/keycloak` and
+`https://gateway.company.example/logout` in the Keycloak web client. Register
+`https://cas-shim.company.example/cas/callback` as the CAS service and configure the Keycloak broker.
+See the [Keycloak reverse proxy documentation](https://www.keycloak.org/server/reverseproxy).
 
 The HR and data adapters are separate applications. Start them from their own project directories
 using their native Windows instructions and configuration. The previous deployment used ports
