@@ -11,10 +11,11 @@ import socket
 import subprocess
 import sys
 import time
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import build_opener, ProxyHandler
 
 from dotenv import dotenv_values
+import httpx
 import psutil
 
 from nginx_bridge import nginx_command, prepare_nginx
@@ -153,6 +154,76 @@ def _prepare_realm(home: Path, env: dict[str, str]) -> None:
         })
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(realm), encoding="utf-8")
+
+
+def _repair_keycloak_web_scopes(env: dict[str, str]) -> None:
+    """Restore the standard web scopes omitted by an old realm import."""
+    realm = env["KEYCLOAK_REALM"]
+    web_client = env["KEYCLOAK_CLIENT_ID"]
+    token_path = "/realms/master/protocol/openid-connect/token"
+    authorize_path = f"/realms/{realm}/protocol/openid-connect/auth"
+    authorize_params = {
+        "client_id": web_client,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "redirect_uri": f"{env['REGISTRY_URL']}/oauth2/callback/keycloak",
+        "code_challenge": "A" * 43,
+        "code_challenge_method": "S256",
+    }
+    with httpx.Client(base_url=env["KEYCLOAK_URL"], trust_env=False, timeout=15) as client:
+        probe = client.get(authorize_path, params=authorize_params)
+        location = urlsplit(probe.headers.get("location", ""))
+        if parse_qs(location.query).get("error") != ["invalid_scope"]:
+            return
+        try:
+            token = client.post(token_path, data={
+                "client_id": "admin-cli",
+                "grant_type": "password",
+                "username": env["KEYCLOAK_ADMIN"],
+                "password": env["KEYCLOAK_ADMIN_PASSWORD"],
+            }).raise_for_status().json()["access_token"]
+            _restore_keycloak_web_scopes(client, realm, web_client, token)
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"Could not restore local Keycloak web scopes: {exc}") from exc
+    print("Keycloak web sign-in scopes restored.")
+
+
+def _restore_keycloak_web_scopes(
+    client: httpx.Client,
+    realm: str,
+    web_client: str,
+    token: str,
+) -> None:
+    headers = {"Authorization": f"Bearer {token}"}
+    realm_api = f"/admin/realms/{realm}"
+    scopes_path = f"{realm_api}/client-scopes"
+    required = {"email", "profile"}
+    scopes = client.get(scopes_path, headers=headers).raise_for_status().json()
+    missing = required.difference(scope["name"] for scope in scopes)
+    if missing:
+        defaults = client.get("/admin/realms/master/client-scopes", headers=headers).raise_for_status().json()
+        for scope in defaults:
+            if scope["name"] in missing:
+                # Copy Keycloak's own mappers, but let the target realm assign IDs.
+                scope.pop("id", None)
+                for mapper in scope.get("protocolMappers", []):
+                    mapper.pop("id", None)
+                client.post(scopes_path, headers=headers, json=scope).raise_for_status()
+        scopes = client.get(scopes_path, headers=headers).raise_for_status().json()
+    selected = {scope["name"]: scope["id"] for scope in scopes if scope["name"] in required}
+    if selected.keys() != required:
+        raise RuntimeError("The local Keycloak master realm lacks the standard email or profile scope.")
+    clients = client.get(f"{realm_api}/clients", params={"clientId": web_client}, headers=headers)
+    web = next((entry for entry in clients.raise_for_status().json() if entry["clientId"] == web_client), None)
+    if web is None:
+        raise RuntimeError(f"Keycloak client {web_client} is missing from {realm}.")
+    client_path = f"{realm_api}/clients/{web['id']}"
+    default_path = f"{client_path}/default-client-scopes"
+    default = client.get(default_path, headers=headers).raise_for_status().json()
+    optional = client.get(f"{client_path}/optional-client-scopes", headers=headers).raise_for_status().json()
+    assigned = {scope["id"] for scope in default + optional}
+    for scope_id in sorted(set(selected.values()) - assigned):
+        client.put(f"{default_path}/{scope_id}", headers=headers).raise_for_status()
 
 
 def _uvicorn(app: str, port: int, *options: str) -> list[str]:
@@ -401,6 +472,8 @@ def _start(args: argparse.Namespace, state_path: Path, state: dict) -> None:
             _wait_ready(name, proc, target, log)
             if name == "mongodb":
                 _bootstrap_database(args.instance, env)
+            elif name == "keycloak":
+                _repair_keycloak_web_scopes(env)
     except BaseException:
         try:
             _stop(state_path, state)

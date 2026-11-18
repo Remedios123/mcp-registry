@@ -61,6 +61,8 @@ username, which defaults to `admin`, and `KEYCLOAK_ADMIN_PASSWORD`. Create a rea
 them in `mcp-registry-admin` to administer the registry. Changing the client secret, public origin,
 or initial Keycloak administrative password on an existing instance also requires updating that
 setting in Keycloak.
+For locally managed Keycloak, startup restores the standard email and profile scopes on the web
+client when Keycloak rejects them during login.
 
 The example uses local Keycloak development mode and loopback MongoDB. The launcher runs the
 upstream MongoDB initializer for a fresh local database, including the Keycloak group-to-scope
