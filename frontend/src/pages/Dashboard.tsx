@@ -1673,7 +1673,10 @@ const Dashboard: React.FC<DashboardProps> = ({ activeFilter = 'all', setActiveFi
           );
         } catch (egressErr: unknown) {
           console.error('Egress auth config failed to apply:', egressErr);
-          failedParts.push('egress auth');
+          const detail = axios.isAxiosError<{ detail?: unknown }>(egressErr)
+            ? egressErr.response?.data?.detail
+            : undefined;
+          failedParts.push(typeof detail === 'string' ? `egress auth (${detail})` : 'egress auth');
         }
       }
 

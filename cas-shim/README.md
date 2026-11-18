@@ -27,10 +27,10 @@ Administrators retain the realm's email login setting.
 4. Enable EGRESS_AUTH_ENABLED on the gateway, configure the upstream secret
    store, and supply ENTERPRISE_CREDENTIAL_PROFILES,
    ENTERPRISE_CREDENTIAL_SHIM_URL, ENTERPRISE_CREDENTIAL_SHIM_PUBLIC_URL,
-   and the same SHIM_INTERNAL_TOKEN to Registry. List the exact registered
-   destination URLs permitted to receive UC credentials.
-5. Edit the HR service and select **Egress Auth → Per-user OAuth → UC**.
-   Enterprise options come from deployment configuration. Reconnect existing
+   and the same SHIM_INTERNAL_TOKEN to Registry.
+5. For each UC-backed service, select **Egress Auth → Per-user OAuth → UC** and
+   save. Registry approves the service's currently registered destinations.
+   Save again to approve any newly registered destination. Reconnect existing
    WorkBuddy connections to receive the protected employee claim.
 
 UC replaces the previous token when refreshing it. The adapter retains

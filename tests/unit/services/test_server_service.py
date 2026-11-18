@@ -1966,11 +1966,13 @@ class TestServerVersionManagement:
         mock_server_repository.update.assert_not_called()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("enterprise_binding", [None, "active", "inactive"])
     async def test_set_default_version_success(
         self,
         server_service: ServerService,
         mock_server_repository,
         mock_search_repository,
+        enterprise_binding,
     ):
         """Test setting default version swaps documents (separate-documents design)."""
         # Arrange - active server with one inactive version
@@ -1993,6 +1995,15 @@ class TestServerVersionManagement:
             "version_group": "versioned-server",
             "active_version_id": "/versioned-server",
         }
+
+        egress = {
+            "provider": "enterprise/uc",
+            "enterprise_approved_upstreams": ["http://localhost:8080"],
+        }
+        if enterprise_binding == "active":
+            active_server.update(egress_auth_mode="oauth_user", egress_oauth=egress)
+        elif enterprise_binding == "inactive":
+            inactive_server.update(egress_auth_mode="oauth_user", egress_oauth=egress)
 
         def mock_get(path):
             if path == "/versioned-server":
@@ -2027,6 +2038,9 @@ class TestServerVersionManagement:
         # Verify documents were deleted and recreated
         assert mock_server_repository.delete.call_count == 2
         assert mock_server_repository.create.call_count == 2
+        promoted, former = (call.args[0] for call in mock_server_repository.create.call_args_list)
+        assert promoted.get("egress_oauth") == (egress if enterprise_binding == "active" else None)
+        assert former.get("egress_oauth") is None
         # Verify search index was updated
         mock_search_repository.index_server.assert_called_once()
 

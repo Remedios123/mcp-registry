@@ -1221,6 +1221,10 @@ class ServerService:
         new_inactive["active_version_id"] = path
         new_inactive.pop("other_version_ids", None)
 
+        from ..egress_auth.enterprise import preserve_service_binding_on_promotion
+
+        preserve_service_binding_on_promotion(new_active, new_inactive)
+
         # Gateway-proxy SSRF layer 2: the promoted version's proxy_pass_url becomes
         # the live effective target. If the promoted doc is proxied, resolve+validate
         # it (a version added earlier bypassed the register/update check) and pin the

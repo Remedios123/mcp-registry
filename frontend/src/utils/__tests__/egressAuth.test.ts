@@ -52,6 +52,21 @@ describe('buildEgressConfigBody', () => {
     });
   });
 
+  it('asks the server to approve the upstream displayed with the enterprise provider', () => {
+    const body = buildEgressConfigBody({
+      ...form,
+      egress_auth_mode: 'oauth_user',
+      egress_provider: 'enterprise/uc',
+      proxyPass: 'https://hr.example.test/mcp',
+    });
+    expect(body).toEqual({
+      egress_auth_mode: 'oauth_user',
+      egress_provider: 'enterprise/uc',
+      enterprise_expected_upstream: 'https://hr.example.test/mcp',
+      list_tools_before_consent: true,
+    });
+  });
+
   it('builds the pat body with the provider only', () => {
     const body = buildEgressConfigBody({ ...form, egress_auth_mode: 'pat' });
     expect(body).toEqual({

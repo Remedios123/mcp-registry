@@ -987,7 +987,10 @@ async def vend_egress_token(
     if is_enterprise:
         try:
             credential = await enterprise.vend(
-                provider, claims.get("enterprise_employee_id") or "", requested_upstream
+                provider,
+                claims.get("enterprise_employee_id") or "",
+                requested_upstream,
+                approved_upstreams=egress_oauth.get("enterprise_approved_upstreams"),
             )
         except enterprise.EnterpriseCredentialDenied as exc:
             raise HTTPException(
@@ -1126,6 +1129,7 @@ class EgressConfigRequest(BaseModel):
 
     egress_auth_mode: str = "oauth_user"  # "none" | "oauth_user" | "obo_exchange" | "pat"
     egress_provider: str = ""
+    enterprise_expected_upstream: str | None = None
     client_id: str = ""
     client_secret: str | None = None  # write-only; encrypted, never echoed
     scopes: list[str] = []
@@ -1314,6 +1318,7 @@ async def configure_egress_auth(
     if not server:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="server not found")
 
+    update_options = {}
     if body.egress_auth_mode == "none":
         server["egress_auth_mode"] = "none"
         server["egress_oauth"] = None
@@ -1331,13 +1336,31 @@ async def configure_egress_auth(
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, detail="server has no valid upstream"
             ) from exc
-        if profile is None or target not in profile.upstreams:
+        if profile is None or (profile.upstreams is not None and target not in profile.upstreams):
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
                 detail="enterprise credential profile does not allow this server upstream",
             )
+        if (
+            body.enterprise_expected_upstream is not None
+            and target != body.enterprise_expected_upstream
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail="Server upstream changed. Reopen the server before saving.",
+            )
+        destinations = await registered_destinations(server, server_path)
+        if profile.upstreams is not None:
+            destinations = [url for url in destinations if url in profile.upstreams]
         server["egress_auth_mode"] = "oauth_user"
-        server["egress_oauth"] = {"provider": body.egress_provider}
+        server["egress_oauth"] = {
+            "provider": body.egress_provider,
+            "enterprise_approved_upstreams": destinations,
+        }
+        update_options = {
+            "updated_fields": ["egress_auth_mode", "egress_oauth", "egress_list_tools_before_consent"],
+            "expected_updated_at": server.get("updated_at"),
+        }
     elif body.egress_auth_mode == "oauth_user":
         eo = build_oauth_provider_config(
             provider=body.egress_provider,
@@ -1408,7 +1431,11 @@ async def configure_egress_auth(
         body.list_tools_before_consent,
     )
 
-    if not await server_service.update_server(server_path, server):
+    if not await server_service.update_server(server_path, server, **update_options):
+        if update_options.get("expected_updated_at") is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, detail="Server changed. Reopen it before saving."
+            )
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="update failed")
     return _egress_config_view(server)
 

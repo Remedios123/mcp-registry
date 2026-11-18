@@ -393,3 +393,44 @@ class TestCallback:
         assert "<b>github</b>" not in r.text
         assert "&lt;svg/onload=alert(1)&gt;" in r.text
         state_codec.reset_cipher_for_tests()
+
+
+class TestEnterpriseBinding:
+    @pytest.fixture(autouse=True)
+    def enable_uc(self, monkeypatch):
+        monkeypatch.setenv(
+            "ENTERPRISE_CREDENTIAL_PROFILES", '[{"id":"uc","label":"UC","issuer":"uc"}]'
+        )
+
+    @pytest.mark.parametrize("endpoint", ["https://hr.example.test/mcp", "https://data.example.test/mcp"])
+    def test_admin_binds_current_service_destination_without_an_env_allowlist(self, client, endpoint):
+        server = _server(proxy_pass_url=endpoint)
+        c = client(ADMIN, server=server)
+        r = c.post("/api/servers/github-mcp/egress-auth", json={
+            "egress_provider": "enterprise/uc",
+            "enterprise_expected_upstream": endpoint,
+        })
+
+        assert r.status_code == 200, r.text
+        saved = routes.server_service.update_server.await_args.args[1]
+        assert saved["egress_oauth"] == {
+            "provider": "enterprise/uc",
+            "enterprise_approved_upstreams": [endpoint],
+        }
+
+    def test_admin_cannot_approve_a_different_address_than_the_one_on_screen(self, client):
+        c = client(ADMIN, server=_server(proxy_pass_url="https://changed.example.test/mcp"))
+        r = c.post("/api/servers/github-mcp/egress-auth", json={
+            "egress_provider": "enterprise/uc",
+            "enterprise_expected_upstream": "https://hr.example.test/mcp",
+        })
+        assert r.status_code == 409
+        routes.server_service.update_server.assert_not_awaited()
+
+    def test_service_owner_cannot_bind_enterprise_credentials(self, client):
+        c = client(USER, server=_server(registered_by=USER["username"]))
+        r = c.post("/api/servers/github-mcp/egress-auth", json={
+            "egress_provider": "enterprise/uc",
+        })
+        assert r.status_code == 403
+        routes.server_service.update_server.assert_not_awaited()

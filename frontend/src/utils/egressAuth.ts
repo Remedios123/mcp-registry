@@ -67,6 +67,7 @@ export interface PatStatus {
 export interface EgressConfigFormFields {
   egress_auth_mode: 'none' | 'oauth_user' | 'obo_exchange' | 'pat';
   egress_provider: string;
+  proxyPass?: string;
   egress_client_id: string;
   egress_client_secret: string;
   egress_scopes: string;
@@ -103,9 +104,18 @@ export function buildEgressConfigBody(form: EgressConfigFormFields): Record<stri
     };
   }
   if (mode === 'oauth_user') {
+    const provider = form.egress_provider.trim();
+    if (provider.startsWith('enterprise/')) {
+      return {
+        egress_auth_mode: 'oauth_user',
+        egress_provider: provider,
+        enterprise_expected_upstream: form.proxyPass,
+        list_tools_before_consent: form.egress_list_tools_before_consent,
+      };
+    }
     return {
       egress_auth_mode: 'oauth_user',
-      egress_provider: form.egress_provider.trim(),
+      egress_provider: provider,
       client_id: form.egress_client_id.trim(),
       // Blank secret on edit keeps the stored one (backend semantics).
       client_secret: form.egress_client_secret || undefined,

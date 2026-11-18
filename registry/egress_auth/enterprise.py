@@ -33,7 +33,7 @@ class CredentialProfile(BaseModel):
     id: _ID
     label: str
     issuer: _ID
-    upstreams: list[str]
+    upstreams: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -53,6 +53,25 @@ def credential_profiles() -> dict[str, CredentialProfile]:
     if len(by_id) != len(profiles):
         raise EnterpriseCredentialUnavailable("duplicate enterprise credential profile ID")
     return by_id
+
+
+def _has_enterprise_binding(server: dict) -> bool:
+    provider = (server.get("egress_oauth") or {}).get("provider") or ""
+    return server.get("egress_auth_mode") == "oauth_user" and provider.startswith(PROVIDER_PREFIX)
+
+
+def preserve_service_binding_on_promotion(promoted: dict, former: dict) -> None:
+    """Keep the service's current enterprise binding with its active version."""
+    fields = ("egress_auth_mode", "egress_oauth", "egress_list_tools_before_consent")
+    if _has_enterprise_binding(former):
+        for field in fields:
+            promoted.pop(field, None)
+            if field in former:
+                promoted[field] = former.pop(field)
+    elif _has_enterprise_binding(promoted):
+        # A legacy inactive record can still carry a superseded binding.
+        for field in fields:
+            promoted.pop(field, None)
 
 
 def _base_origin(name: str) -> str:
@@ -85,10 +104,26 @@ def _authorization_link(body: dict) -> str:
     raise EnterpriseCredentialUnavailable("invalid business authorization link")
 
 
-async def vend(provider: str, employee_id: str, upstream: str) -> Credential:
+async def vend(
+    provider: str,
+    employee_id: str,
+    upstream: str,
+    *,
+    approved_upstreams: list[str] | None = None,
+) -> Credential:
     """Return a profile credential or a link for a verified employee and approved target."""
     profile = credential_profiles().get(provider)
-    if not profile or upstream not in profile.upstreams or not _ACCOUNT.fullmatch(employee_id):
+    if (
+        profile is None
+        or not _ACCOUNT.fullmatch(employee_id)
+        # Existing bindings may rely on their deployment allowlist.
+        or (approved_upstreams is None and profile.upstreams is None)
+        or (
+            approved_upstreams is not None
+            and (not isinstance(approved_upstreams, list) or upstream not in approved_upstreams)
+        )
+        or (profile.upstreams is not None and upstream not in profile.upstreams)
+    ):
         raise EnterpriseCredentialDenied("employee or upstream is outside the credential profile")
     base = _base_origin("ENTERPRISE_CREDENTIAL_SHIM_URL")
     secret = os.getenv("SHIM_INTERNAL_TOKEN", "")

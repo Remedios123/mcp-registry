@@ -70,12 +70,9 @@ def redact_server_backend_fields(
 ) -> dict:
     """Strip internal backend URL fields from a flat server/version dict in place.
 
-    Removes ``proxy_pass_url``, ``mcp_endpoint`` and ``sse_endpoint`` from the
-    top-level dict and, if present, from each entry of an embedded ``versions``
-    list. Mutates and returns the same dict so callers can chain. This mirrors
-    the ``proxy_pass_url`` stripping in ``GET /servers/{path}`` but also covers
-    the endpoint-override fields and per-version URLs that other read surfaces
-    expose.
+    Removes upstream URLs, including stored enterprise credential destinations,
+    from the top-level dict and each entry of an embedded ``versions`` list.
+    Mutates and returns the same dict so callers can chain.
 
     Callers MUST gate this behind :func:`should_redact_backend_urls`; this
     function performs no authorization decision of its own.
@@ -86,15 +83,19 @@ def redact_server_backend_fields(
     Returns:
         The same dict, with backend URL fields removed.
     """
-    for field in _BACKEND_URL_FIELDS:
-        server_dict.pop(field, None)
-
+    documents = [server_dict]
     versions = server_dict.get("versions")
     if isinstance(versions, list):
-        for version in versions:
-            if isinstance(version, dict):
-                for field in _BACKEND_URL_FIELDS:
-                    version.pop(field, None)
+        documents.extend(version for version in versions if isinstance(version, dict))
+
+    for document in documents:
+        for field in _BACKEND_URL_FIELDS:
+            document.pop(field, None)
+        oauth = document.get("egress_oauth")
+        if isinstance(oauth, dict) and "enterprise_approved_upstreams" in oauth:
+            public_oauth = dict(oauth)
+            public_oauth.pop("enterprise_approved_upstreams")
+            document["egress_oauth"] = public_oauth
 
     return server_dict
 

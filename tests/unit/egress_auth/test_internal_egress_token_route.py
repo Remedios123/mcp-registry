@@ -544,7 +544,9 @@ def test_enterprise_vends_using_the_signed_employee_claim(make_client, monkeypat
     response = _post(client)
 
     assert response.json()["access_token"] == "fixture-uc-token"
-    vend.assert_awaited_once_with("enterprise/uc", "EMP001", "https://api.githubcopilot.com/mcp")
+    vend.assert_awaited_once_with(
+        "enterprise/uc", "EMP001", "https://api.githubcopilot.com/mcp", approved_upstreams=None
+    )
     assert not client._svc.called
 
 
@@ -560,3 +562,49 @@ def test_enterprise_vend_refuses_a_non_employee_authentication_method(make_clien
 
     assert _post(client).status_code == 403
     vend.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("approved", "allowlist", "expected_status"),
+    [
+        (["https://api.githubcopilot.com/mcp"], None, 200),
+        (["https://old.example.test/mcp"], None, 403),
+        (None, None, 403),
+        (None, ["https://api.githubcopilot.com/mcp"], 200),
+        (["https://api.githubcopilot.com/mcp"], ["https://old.example.test/mcp"], 403),
+    ],
+)
+def test_enterprise_vend_requires_the_saved_approval_for_the_signed_destination(
+    make_client, monkeypatch, approved, allowlist, expected_status,
+):
+    import json
+    from unittest.mock import AsyncMock
+
+    import httpx
+
+    profile = {"id": "uc", "label": "UC", "issuer": "uc"}
+    if allowlist is not None:
+        profile["upstreams"] = allowlist
+    monkeypatch.setenv("ENTERPRISE_CREDENTIAL_PROFILES", json.dumps([profile]))
+    monkeypatch.setenv("ENTERPRISE_CREDENTIAL_SHIM_URL", "http://127.0.0.1:8085")
+    monkeypatch.setenv("SHIM_INTERNAL_TOKEN", "x" * 40)
+    adapter = AsyncMock()
+    adapter.get.return_value = httpx.Response(200, json={
+        "account": "EMP001", "profile": "uc", "token": "fixture-uc-token",
+    })
+    monkeypatch.setattr(routes.enterprise, "shared_guarded_async_client", lambda **_: adapter)
+    oauth = {"provider": "enterprise/uc"}
+    if approved is not None:
+        oauth["enterprise_approved_upstreams"] = approved
+    client = make_client(
+        _claims(enterprise_employee_id="EMP001"),
+        _server(egress_oauth=oauth),
+    )
+
+    response = _post(client)
+    assert response.status_code == expected_status, response.text
+    if expected_status == 403:
+        adapter.get.assert_not_awaited()
+    else:
+        assert response.json()["access_token"] == "fixture-uc-token"
+        adapter.get.assert_awaited_once()

@@ -317,13 +317,22 @@ class TestBackendUrlRedactionHelpers:
     def test_redact_strips_top_level_and_versions(self):
         from registry.services.visibility import redact_server_backend_fields
 
+        egress_oauth = {
+            "provider": "enterprise/uc",
+            "enterprise_approved_upstreams": ["http://internal:8080/mcp"],
+        }
         doc = {
             "server_name": "s",
             "proxy_pass_url": "http://internal:8080",
+            "egress_oauth": egress_oauth,
             "mcp_endpoint": "http://internal:8080/mcp",
             "sse_endpoint": "http://internal:8080/sse",
             "versions": [
-                {"version": "v1", "proxy_pass_url": "http://internal:8081"},
+                {
+                    "version": "v1",
+                    "proxy_pass_url": "http://internal:8081",
+                    "egress_oauth": egress_oauth,
+                },
                 {"version": "v2", "mcp_endpoint": "http://internal:8082/mcp"},
             ],
         }
@@ -339,6 +348,9 @@ class TestBackendUrlRedactionHelpers:
         # Non-URL fields are preserved.
         assert doc["server_name"] == "s"
         assert doc["versions"][0]["version"] == "v1"
+        assert doc["egress_oauth"] == {"provider": "enterprise/uc"}
+        assert doc["versions"][0]["egress_oauth"] == {"provider": "enterprise/uc"}
+        assert egress_oauth["enterprise_approved_upstreams"] == ["http://internal:8080/mcp"]
 
     def test_redact_agent_strips_proxy_pass_url(self):
         """The agent redactor removes proxy_pass_url (both spellings), keeps url."""

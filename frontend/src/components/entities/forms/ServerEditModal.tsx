@@ -541,6 +541,12 @@ const ServerEditModal: React.FC<ServerEditModalProps> = ({
                         </option>
                       )}
                     </select>
+                    {isEnterpriseCredential && (
+                      <p className="text-xs text-fg-muted mt-1">
+                        Saving allows this service's registered endpoints to receive each authorized
+                        user's business credential. Save again to approve a new endpoint.
+                      </p>
+                    )}
                     {enterpriseProfilesError && (
                       <p className="text-xs text-fg-muted">Could not load enterprise credential profiles.</p>
                     )}

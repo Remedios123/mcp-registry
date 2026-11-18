@@ -131,24 +131,28 @@ enabled and use explicit values if you set `MCPGW_HTTP_ALLOWED_HOSTS`.
    ports and a browser on the gateway machine, that callback is
    `http://127.0.0.1:8085/cas/callback`. For a browser on another computer, follow the
    [public HTTPS configuration](#browsers-accessing-the-gateway-from-another-computer).
-4. To enable HR calls, start the HR adapter and add the following settings to `gateway.env`
-   before starting the gateway. Replace the example URL in `upstreams` with the exact HR MCP
-   URL you will register. For a loopback HTTP adapter, also set `SSRF_ALLOWED_CIDRS=127.0.0.1/32`
+4. For UC-backed services, enable the UC provider once in `gateway.env` before starting
+   the gateway. For a loopback HTTP adapter, also set `SSRF_ALLOWED_CIDRS=127.0.0.1/32`
    and `MCP_HTTPS_REQUIRED=false`.
 
    ```dotenv
    EGRESS_AUTH_ENABLED=true
-   ENTERPRISE_CREDENTIAL_PROFILES=[{"id":"uc","label":"UC","issuer":"uc","upstreams":["http://127.0.0.1:8000/mcp"]}]
+   ENTERPRISE_CREDENTIAL_PROFILES=[{"id":"uc","label":"UC","issuer":"uc"}]
    ```
 
 5. If the gateway is already running, double-click [stop-gateway.bat](stop-gateway.bat) once,
    then double-click [start-gateway.bat](start-gateway.bat). On the default local instance open
    `http://127.0.0.1:17860/`, select **Continue with Keycloak**, then **企业内部登录**.
    The CAS account uses its employee ID without email or name.
-6. In the Registry, register or edit HR, choose UC under
-   **Egress Auth → Per-user OAuth → Enterprise credentials**, and grant its tools and the
-   Registry Tools entry point to the relevant employee group. WorkBuddy connects to
+6. Register the MCP service. In its edit dialog choose UC under
+   **Egress Auth → Per-user OAuth → Enterprise credentials** and save. Each UC-backed service
+   gets its own destination approval. Grant its tools and the Registry Tools entry point to
+   the relevant employee group. WorkBuddy connects to
    `http://127.0.0.1:17860/airegistry-tools/mcp` on the default local instance.
+
+If you already have an explicit `upstreams` list, it continues to restrict the profile. To manage
+destinations through the UI alone, save each existing UC service's Egress Auth in the upgraded
+Registry once, remove the `upstreams` property from the profile, and restart the gateway.
 
 On later launches use the same `gateway.env`. Enable external MongoDB by setting
 `WINDOWS_MANAGE_MONGO=false`, with authenticated `MONGODB_CONNECTION_STRING` and

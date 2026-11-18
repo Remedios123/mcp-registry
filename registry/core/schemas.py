@@ -455,6 +455,8 @@ class EgressOAuthConfig(BaseModel):
         "When set, the egress OAuth callback rejects a sign-in reply whose iss names a "
         "different issuer. Empty keeps the callback as before.",
     )
+    # Exact destinations approved by an administrator when saving an enterprise provider.
+    enterprise_approved_upstreams: list[str] | None = None
     updated_at: str | None = None
 
 
