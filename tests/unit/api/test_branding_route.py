@@ -359,6 +359,31 @@ class TestBrandingRouteSwapDuringOpen:
         assert response.status_code == status.HTTP_404_NOT_FOUND
         assert "secret" not in response.text
 
+    @pytest.mark.skipif(os.name != "nt", reason="Windows checks the open file handle")
+    def test_windows_refuses_a_handle_outside_the_folder_before_reading(
+        self,
+        branding_dir: Path,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        outside = branding_dir.parent / "secret.css"
+        outside.write_text("secret{}")
+        theme = branding_dir / "theme.css"
+        theme.write_text("a{}")
+        target = theme.resolve()
+        open_file = os.open
+
+        def _open(path, flags, *args, **kwargs):  # noqa: ANN001, ANN202 - os.open signature
+            return open_file(outside if Path(path) == target else path, flags, *args, **kwargs)
+
+        def _unexpected_read(fd: int) -> None:
+            pytest.fail("An open file outside the branding folder must not be read")
+
+        monkeypatch.setattr(branding_files.os, "open", _open)
+        monkeypatch.setattr(branding_files, "_read_open_file", _unexpected_read)
+
+        assert client.get("/branding/theme.css").status_code == status.HTTP_404_NOT_FOUND
+
     @pytest.mark.parametrize("swap_back", [False, True], ids=["left-swapped", "swapped-back"])
     def test_parent_dir_swapped_for_symlink_is_refused(
         self,

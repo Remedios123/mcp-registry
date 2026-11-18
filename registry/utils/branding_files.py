@@ -165,6 +165,37 @@ def _read_open_file(
     return stat_result, data
 
 
+def _windows_comparison_path(path: str) -> Path:
+    """Normalize the extended-length prefix returned by Windows file handles."""
+    unc_prefix = "\\\\?\\UNC\\"
+    if path[:len(unc_prefix)].upper() == unc_prefix:
+        return Path("\\\\" + path[len(unc_prefix):])
+    return Path(path.removeprefix("\\\\?\\"))
+
+
+def _check_windows_file_path(fd: int, base: Path) -> None:
+    """Check the resolved path of the actual open handle before reading it."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    get_path = ctypes.WinDLL("kernel32", use_last_error=True).GetFinalPathNameByHandleW
+    get_path.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
+    get_path.restype = wintypes.DWORD
+    handle = msvcrt.get_osfhandle(fd)
+    required = get_path(handle, None, 0, 0)
+    if not required:
+        raise BrandingFileRefusedError("cannot resolve the open branding file")
+    buffer = ctypes.create_unicode_buffer(required)
+    copied = get_path(handle, buffer, len(buffer), 0)
+    if not 0 < copied < len(buffer):
+        raise BrandingFileRefusedError("cannot resolve the open branding file")
+    opened_path = _windows_comparison_path(buffer.value)
+    root = _windows_comparison_path(str(base))
+    if not opened_path.is_relative_to(root) or opened_path == root:
+        raise BrandingFileRefusedError("open file resolves outside the branding folder")
+
+
 def read_branding_file(
     branding_dir: Path,
     name: str,
@@ -177,10 +208,11 @@ def read_branding_file(
 
     The file is checked and read through one descriptor, so a path swapped
     after the containment check cannot change what is served. The final
-    component is opened with ``O_NOFOLLOW`` (a symlink swapped in fails) and
+    component on POSIX is opened with ``O_NOFOLLOW`` (a symlink swapped in fails) and
     ``O_NONBLOCK`` (a FIFO swapped in cannot hang the worker). A swapped
     parent directory is caught after the open: the name is resolved again and
     must still land inside the folder on the same inode as the descriptor.
+    On Windows the open handle is also checked for containment before reading.
 
     Args:
         branding_dir: The configured branding folder (may not exist).
@@ -203,13 +235,18 @@ def read_branding_file(
 
     # FileNotFoundError propagates: the caller serves a default or a 404.
     try:
-        fd = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        if os.name == "nt":
+            fd = os.open(resolved, os.O_RDONLY | os.O_BINARY)
+        else:
+            fd = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         raise
     except OSError as e:
         raise BrandingFileRefusedError(f"cannot open file: {e}") from e
 
     try:
+        if os.name == "nt":
+            _check_windows_file_path(fd, base)
         stat_result, data = _read_open_file(fd)
     finally:
         os.close(fd)
