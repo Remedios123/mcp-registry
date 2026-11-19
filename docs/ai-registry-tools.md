@@ -207,15 +207,13 @@ AI: "Yes, there's a travel-assistant-agent that can help with
 
 **Use a tool you just found:**
 
-`search_registry` returns compact catalog entries with up to five distinct tools by default. A tool matched directly and through its server appears once, with both sources in `matched_by`. Run a focused search with `include_schema=true` for the full tool input schema and server connection details. Use `metadata_fields` to request catalog metadata.
-
 The server tells the agent two ways to use a discovered tool. The recommended way is to add the server's `endpoint_url` to the MCP client (for Claude Code, `claude mcp add --transport http --scope user <name> <endpoint_url>`). The client then signs you in with OAuth, so the agent never handles a token. The new tools usually appear only after a session restart.
 
 If the agent can run shell commands, it can also call the tool right away: it POSTs MCP JSON-RPC (`initialize`, `notifications/initialized`, then `tools/call`) to the `endpoint_url` with curl. It reads the bearer token from the `REGISTRY_TOKEN` environment variable, and asks you to export it when the variable is unset. Your MCP client's own OAuth token is not visible to the agent, so this path needs a token of its own. Get one from the registry UI and export it in the shell you start the agent from.
 
 ```
 You: "Look up how Cloudflare Workers handle cron triggers"
-AI: *calls search_registry(query="cloudflare documentation", include_schema=true)*
+AI: *calls search_registry(query="cloudflare documentation")*
 AI: *finds the cloudflare-docs server and its search tool, with inputSchema*
 AI: *asks permission, then runs curl against the endpoint_url: initialize,
      notifications/initialized, tools/call*

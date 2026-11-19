@@ -307,8 +307,7 @@ mcp = FastMCP(
         "tools, agents, and skills that you can discover and use. "
         "Start with search_registry to find relevant AI assets by describing "
         "what you need in natural language. Once you find a useful MCP server, "
-        "search with include_schema=true for connection details and tool input schemas. "
-        "You can use its tools in one of two ways. "
+        "you can use its tools in one of two ways. "
         "The recommended way is to add the server to your MCP client, which then "
         "signs the user in with OAuth, so you never handle a token. For Claude "
         "Code: claude mcp add --transport http --scope user <name> <endpoint_url>. "
@@ -1130,110 +1129,24 @@ async def get_custom_entity(
         return {"path": path, "error": str(e), "status": "failed"}
 
 
-def _catalog_summary(description: str | None) -> str:
-    return next((line.strip()[:320] for line in (description or "").splitlines() if line.strip()), "")
-
-
-def _merge_catalog_tools(
-    tools: list[dict[str, Any]],
-    servers: list[dict[str, Any]],
-    virtual_servers: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Merge authorized tool hits while retaining their strongest score and origins."""
-    by_tool: dict[tuple[str, str], dict[str, Any]] = {}
-
-    def add(tool: dict[str, Any], path: str, source: str, endpoint: str | None = None) -> None:
-        name = tool.get("tool_name") or tool.get("name")
-        if not path or not name:
-            return
-        key = (path.strip("/"), name)
-        score = tool.get("relevance_score") or tool.get("score") or 0.0
-        hit = by_tool.setdefault(key, {
-            "server_path": path,
-            "tool_name": name,
-            "description": "",
-            "relevance_score": score,
-            "matched_by": [],
-        })
-        if source not in hit["matched_by"]:
-            hit["matched_by"].append(source)
-            hit["matched_by"].sort(key=("tool", "server").index)
-        if score >= hit["relevance_score"] or not hit["description"]:
-            hit["description"] = tool.get("description") or hit["description"]
-        hit["relevance_score"] = max(hit["relevance_score"], score)
-
-        schema = tool.get("inputSchema")
-        if isinstance(schema, dict) and not hit.get("inputSchema"):
-            hit["inputSchema"] = schema
-        endpoint = tool.get("endpoint_url") or endpoint
-        if endpoint:
-            hit.setdefault("endpoint_url", endpoint)
-
-    for tool in tools:
-        source = "server" if tool.get("match_source") == "server" else "tool"
-        add(tool, tool.get("server_path") or tool.get("path") or "", source)
-    for server in (*servers, *virtual_servers):
-        for tool in server.get("matching_tools") or []:
-            add(tool, server.get("path") or "", "server", server.get("endpoint_url"))
-    return sorted(by_tool.values(), key=lambda hit: hit["relevance_score"], reverse=True)
-
-
-def _catalog_tool_view(hit: dict[str, Any], include_schema: bool) -> dict[str, Any]:
-    schema = hit.get("inputSchema") or {}
-    properties = schema.get("properties")
-    view = {
-        "server_path": hit["server_path"],
-        "tool_name": hit["tool_name"],
-        "description": _catalog_summary(hit["description"]),
-        "parameter_names": list(properties) if isinstance(properties, dict) else [],
-        "relevance_score": hit["relevance_score"],
-        "matched_by": hit["matched_by"],
-    }
-    if include_schema:
-        view["inputSchema"] = hit.get("inputSchema")
-        if hit.get("endpoint_url"):
-            view["endpoint_url"] = hit["endpoint_url"]
-    return view
-
-
-def _catalog_server_view(
-    server: dict[str, Any], include_schema: bool, metadata_fields: str | None
-) -> dict[str, Any]:
-    view = {
-        "path": server.get("path", ""),
-        "server_name": server.get("server_name", ""),
-        "num_tools": server.get("num_tools", 0),
-        "description": _catalog_summary(server.get("description")),
-    }
-    if _names_metadata_keys(metadata_fields) and isinstance(server.get("metadata"), dict):
-        view["metadata"] = server["metadata"]
-    if include_schema:
-        for key in ("endpoint_url", "deployment", "local_runtime"):
-            if server.get(key) is not None:
-                view[key] = server[key]
-    return view
-
-
 @mcp.tool()
 @track_tool()
 async def search_registry(
     query: str,
-    max_results: int = 5,
+    max_results: int = 10,
     include_discovery_receipt: bool = False,
     metadata_fields: str | None = None,
     ctx: Context | None = None,
-    *,
-    include_schema: bool = False,
 ) -> dict[str, Any]:
     """
     Discover AI assets (MCP servers, tools, agents, skills, and any custom
     catalog types this registry defines) by describing what you need. Use this
     as your first step when you need a capability you don't currently have.
 
-    Servers and tools are returned as compact catalog entries. Tools include
-    parameter names and match sources. Set include_schema=True on a focused
-    search to obtain complete tool input schemas and server connection details.
-    Other results include:
+    Results include connection details so you can use the discovered assets:
+    - Servers: have an endpoint_url field you can connect to directly as an
+      MCP server (add it to your MCP client's server configuration)
+    - Tools: individual capabilities within servers, with inputSchema
     - Agents: autonomous agents with a URL you can delegate tasks to
     - Skills: workflow instructions (use get_skill_content to fetch the full markdown).
       health_status is "healthy" (SKILL.md was reachable when last checked),
@@ -1271,8 +1184,7 @@ async def search_registry(
 
     Args:
         query: What capability or tool you are looking for (natural language)
-        max_results: Maximum unique tool results and search depth (default: 5, max: 50)
-        include_schema: Include full input schemas and connection details (default: False).
+        max_results: Number of results to return (default: 10, max: 50)
         include_discovery_receipt: Include compact eval metadata about exposed and withheld results
         metadata_fields: Comma-separated metadata keys to return on each result,
             in dot-notation for nested keys (e.g. "owner_team,config.region").
@@ -1345,25 +1257,38 @@ async def search_registry(
         virtual_servers = data.get("virtual_servers", []) if isinstance(data, dict) else []
         custom = data.get("custom", []) if isinstance(data, dict) else []
 
-        ranked_tools = _merge_catalog_tools(tools, servers, virtual_servers)
-        tools = [_catalog_tool_view(tool, include_schema) for tool in ranked_tools[:max_results]]
-        servers = [
-            _catalog_server_view(server, include_schema, metadata_fields) for server in servers
-        ]
-        virtual_servers = [
-            {key: value for key, value in server.items() if key != "matching_tools"}
-            for server in virtual_servers
-        ]
-
-        candidate_results = [
-            {
-                "asset_type": "tool",
-                "service_path": tool["server_path"],
-                "name": tool["tool_name"],
-                "similarity_score": tool["relevance_score"],
-            }
-            for tool in ranked_tools
-        ]
+        candidate_results = []
+        for tool in tools:
+            candidate_results.append(
+                {
+                    "asset_type": "tool",
+                    "service_path": tool.get("server_path") or tool.get("path") or "",
+                    "name": tool.get("tool_name") or tool.get("name") or "",
+                    "similarity_score": tool.get("relevance_score") or tool.get("score"),
+                }
+            )
+        for server in servers:
+            server_path = server.get("path", "")
+            for tool in server.get("matching_tools", []):
+                candidate_results.append(
+                    {
+                        "asset_type": "tool",
+                        "service_path": server_path,
+                        "name": tool.get("tool_name", ""),
+                        "similarity_score": tool.get("relevance_score"),
+                    }
+                )
+        for virtual_server in virtual_servers:
+            vs_path = virtual_server.get("path", "")
+            for tool in virtual_server.get("matching_tools", []):
+                candidate_results.append(
+                    {
+                        "asset_type": "tool",
+                        "service_path": vs_path,
+                        "name": tool.get("tool_name", ""),
+                        "similarity_score": tool.get("relevance_score"),
+                    }
+                )
         for agent in agents:
             candidate_results.append(
                 {
