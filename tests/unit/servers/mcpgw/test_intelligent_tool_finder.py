@@ -4,6 +4,7 @@ Tests verify the fix for GitHub Issue #682: top_n parameter was ignored
 due to wrong field names in the HTTP request and missing client-side truncation.
 """
 
+import json
 import sys
 import types
 from pathlib import Path
@@ -360,7 +361,8 @@ async def test_search_registry_receipt_counts_withheld_matching_tools():
     )
 
     receipt = result["discovery_receipt"]
-    assert result["total_results"] == 1
+    assert result["total_results"] == 3
+    assert len(result["tools"]) == 2
     assert receipt["exposed_results"] == [
         {"asset_type": "tool", "service_path": "/a", "name": "tool_0", "similarity_score": 1.0},
         {"asset_type": "tool", "service_path": "/a", "name": "tool_1", "similarity_score": 0.95},
@@ -401,7 +403,8 @@ async def test_search_registry_receipt_counts_top_level_tools():
     )
 
     receipt = result["discovery_receipt"]
-    assert result["total_results"] == 3
+    assert result["total_results"] == 2
+    assert len(result["tools"]) == 2
     assert len(receipt["exposed_results"]) == 2
     assert receipt["withheld"]["candidate_result_count"] == 1
 
@@ -639,7 +642,8 @@ async def test_search_registry_returns_virtual_servers():
 
     result = await _call_search_registry(mock_resp, query="bundled tools")
 
-    assert result["virtual_servers"] == [_make_virtual_server()]
+    assert result["virtual_servers"] == [{"path": "/bundle", "server_name": "bundle", "backend_count": 2}]
+    assert [tool["tool_name"] for tool in result["tools"]] == ["vs_tool_0", "vs_tool_1"]
 
 
 @pytest.mark.asyncio
@@ -658,7 +662,7 @@ async def test_virtual_servers_count_toward_total_results():
 
     result = await _call_search_registry(mock_resp, query="bundled tools")
 
-    assert result["total_results"] == 3
+    assert result["total_results"] == 8
 
 
 @pytest.mark.asyncio
@@ -797,7 +801,7 @@ async def test_custom_records_count_toward_total_results():
 
     result = await _call_search_registry(mock_resp, query="prompts")
 
-    assert result["total_results"] == 3
+    assert result["total_results"] == 4
 
 
 @pytest.mark.asyncio
@@ -1005,3 +1009,93 @@ async def test_receipt_ranking_tolerates_a_missing_score():
     receipt = result["discovery_receipt"]
     assert receipt["exposed_results"][0]["name"] == "scored"
     assert receipt["withheld"]["top_withheld"][0]["name"] == "unscored"
+
+
+@pytest.mark.asyncio
+async def test_search_registry_compacts_tools_and_merges_matching_sources():
+    schema = {"type": "object", "properties": {"conditions": {}, "limit": {}}}
+    tool = {
+        "server_path": "/analytics",
+        "tool_name": "query_data",
+        "description": "Query data.\nLarge secondary documentation.",
+        "inputSchema": schema,
+        "relevance_score": 1.0,
+        "endpoint_url": "https://gateway.example/analytics/mcp",
+    }
+    mock = _make_mock_response(servers=[{
+        "path": "/analytics",
+        "server_name": "Analytics",
+        "description": "Analytics tools.",
+        "num_tools": 1,
+        "deployment": "remote",
+        "proxy_pass_url": "http://internal.example/mcp",
+        "endpoint_url": "https://gateway.example/analytics/mcp",
+        "metadata": None,
+        "matching_tools": [{**tool, "relevance_score": 0.68}],
+    }])
+    mock.json.return_value["tools"] = [
+        {**tool, "match_source": "tool"},
+        {**tool, "match_source": "server", "relevance_score": 0.68},
+    ]
+    capture = {}
+    compact = await _call_with_mocked_registry(
+        search_registry, mock, query="query data", capture=capture,
+    )
+    assert capture["json"]["max_results"] == 5
+    assert compact["servers"] == [{
+        "path": "/analytics", "server_name": "Analytics",
+        "description": "Analytics tools.", "num_tools": 1,
+    }]
+    assert compact["tools"] == [{
+        "server_path": "/analytics", "tool_name": "query_data", "description": "Query data.",
+        "parameter_names": ["conditions", "limit"], "relevance_score": 1.0,
+        "matched_by": ["tool", "server"],
+    }]
+    assert compact["total_results"] == 2
+
+    expanded = await _call_with_mocked_registry(
+        search_registry, mock, query="query data", include_schema=True,
+    )
+    assert expanded["tools"][0]["inputSchema"] == schema
+    assert expanded["tools"][0]["endpoint_url"] == tool["endpoint_url"]
+    assert expanded["servers"][0]["endpoint_url"] == tool["endpoint_url"]
+    assert len(expanded["tools"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_search_registry_keeps_large_catalog_payload_under_three_kilobytes():
+    schema = {
+        "type": "object",
+        "properties": {"conditions": {"description": "detail " * 430}, "limit": {}},
+    }
+    direct_tools = [
+        {
+            "server_path": f"/server-{i % 4}", "tool_name": f"query_data_{i}",
+            "description": "Query data with conditions and a limit.",
+            "inputSchema": schema, "relevance_score": 1.0 - i * 0.01, "match_source": "tool",
+        }
+        for i in range(10)
+    ]
+    expanded_tools = [
+        {**tool, "match_source": "server", "relevance_score": 0.68}
+        for tool in direct_tools[:9]
+    ]
+    servers = [
+        {
+            "path": f"/server-{i}", "server_name": f"Server {i}", "num_tools": 15,
+            "description": "Query analytics data.", "metadata": None,
+            "matching_tools": [tool for tool in expanded_tools if tool["server_path"] == f"/server-{i}"],
+        }
+        for i in range(4)
+    ]
+    mock = _make_mock_response(servers=servers)
+    mock.json.return_value["tools"] = [*direct_tools, *expanded_tools]
+
+    result = await _call_with_mocked_registry(search_registry, mock, query="query data")
+
+    assert len(json.dumps(mock.json.return_value).encode()) > 80_000
+    assert len(json.dumps(result).encode()) < 3_000
+    assert [tool["tool_name"] for tool in result["tools"]] == [
+        f"query_data_{i}" for i in range(5)
+    ]
+    assert result["total_results"] == 9

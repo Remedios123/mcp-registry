@@ -258,6 +258,7 @@ class ToolSearchResult(BaseModel):
     server_path: str
     server_name: str
     tool_name: str
+    match_source: Literal["tool", "server"] = "tool"
     description: str | None = None
     inputSchema: dict | None = Field(default=None, description="JSON Schema for tool input")
     relevance_score: float = Field(..., ge=0.0, le=1.0)
@@ -1011,6 +1012,7 @@ async def semantic_search(
                 server_path=server_path,
                 server_name=server_name,
                 tool_name=tool.get("tool_name", ""),
+                match_source="server" if tool.get("entity_type") == "tool" else "tool",
                 description=tool.get("description"),
                 inputSchema=tool.get("inputSchema"),
                 relevance_score=tool.get("relevance_score", 0.0),
