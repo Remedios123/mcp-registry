@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+from copy import deepcopy
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -12,6 +13,8 @@ from urllib.request import Request, urlopen
 
 CLAIM = "employee_id"
 SCOPE = "cas-employee"
+DCR_SCOPES = ("profile", "offline_access", "openid", "email", "basic")
+POLICY_TYPE = "org.keycloak.services.clientregistration.policy.ClientRegistrationPolicy"
 
 
 class AdminAPI:
@@ -29,9 +32,15 @@ class AdminAPI:
         with urlopen(target, data=form, timeout=15) as response:
             self.token = json.load(response)["access_token"]
 
-    def call(self, method: str, path: str, body: dict | None = None):
+    def call(self, method: str, path: str, body: dict | list | None = None):
+        return self._request(method, self.realm_api + path, body)
+
+    def standard_scopes(self) -> list[dict]:
+        return self._request("GET", f"{self.origin}/admin/realms/master/client-scopes", None)
+
+    def _request(self, method: str, url: str, body: dict | list | None):
         request = Request(
-            self.realm_api + path,
+            url,
             method=method,
             data=json.dumps(body).encode() if body is not None else None,
             headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"},
@@ -40,14 +49,19 @@ class AdminAPI:
             with urlopen(request, timeout=15) as response:
                 contents = response.read()
         except HTTPError as exc:
-            raise RuntimeError(f"Keycloak {method} {path} returned {exc.code}") from exc
+            raise RuntimeError(f"Keycloak {method} {url} returned {exc.code}") from exc
         return json.loads(contents) if contents else None
 
 
 def upsert_mapper(api: AdminAPI, endpoint: str, payload: dict) -> None:
     current = next((x for x in api.call("GET", endpoint) if x["name"] == payload["name"]), None)
     if current:
-        api.call("PUT", f"{endpoint}/{current['id']}", {**current, **payload})
+        config = payload["config"]
+        mapper_type = "protocolMapper" if "protocolMapper" in payload else "identityProviderMapper"
+        if current.get(mapper_type) != payload[mapper_type] or any(
+            current.get("config", {}).get(key) != value for key, value in config.items()
+        ):
+            raise RuntimeError(f"Conflicting mapper {payload['name']} at {endpoint}; review it in Keycloak")
     else:
         api.call("POST", endpoint, payload)
 
@@ -161,16 +175,108 @@ def _configure_realm_defaults(api: AdminAPI) -> None:
             api.call("PUT", "/authentication/required-actions/VERIFY_PROFILE", {
                 **action, "enabled": False, "defaultAction": False,
             })
-    scopes = api.call("GET", "/client-scopes")
-    if not any(scope["name"] == "openid" for scope in scopes):
-        api.call("POST", "/client-scopes", {
-            "name": "openid", "protocol": "openid-connect",
-            "attributes": {"include.in.token.scope": "true", "display.on.consent.screen": "false"},
+
+
+def _ensure_dcr_scopes(api: AdminAPI) -> dict[str, str]:
+    scopes = {item["name"]: item["id"] for item in api.call("GET", "/client-scopes")}
+    missing = set(DCR_SCOPES).difference(scopes)
+    templates = {}
+    if missing - {"openid"}:
+        templates = {item["name"]: item for item in api.standard_scopes()}
+    for name in sorted(missing):
+        if name == "openid":
+            scope = {"name": name, "protocol": "openid-connect", "attributes": {
+                "include.in.token.scope": "true", "display.on.consent.screen": "false",
+            }}
+        else:
+            if name not in templates:
+                raise RuntimeError(f"Missing standard Keycloak scope {name} in master")
+            scope = deepcopy(templates[name])
+            scope.pop("id", None)
+            for mapper in scope.get("protocolMappers", []):
+                mapper.pop("id", None)
+        api.call("POST", "/client-scopes", scope)
+    if missing:
+        scopes = {item["name"]: item["id"] for item in api.call("GET", "/client-scopes")}
+    # The built-in offline scope uses a realm role mapping. Importing a scope
+    # representation alone does not copy its role mappings between realms.
+    offline = f"/client-scopes/{scopes['offline_access']}/scope-mappings/realm"
+    mapped_roles = api.call("GET", offline)
+    if mapped_roles and not any(role["name"] == "offline_access" for role in mapped_roles):
+        raise RuntimeError("Conflicting offline_access role mapping; review it in Keycloak")
+    if not mapped_roles:
+        api.call("POST", offline, [api.call("GET", "/roles/offline_access")])
+    return scopes
+
+
+def _configure_registration(api: AdminAPI) -> None:
+    realm_id = api.call("GET", "")["id"]
+    query = urlencode({"type": POLICY_TYPE, "parent": realm_id})
+    policies = {item["providerId"]: item for item in api.call("GET", f"/components?{query}")
+                if item.get("subType") == "anonymous"}
+
+    def apply(provider: str, name: str, changes: dict) -> None:
+        current = policies.get(provider)
+        if current is None:
+            api.call("POST", "/components", {
+                "name": name, "providerId": provider, "providerType": POLICY_TYPE,
+                "parentId": realm_id, "subType": "anonymous", "config": changes,
+            })
+        elif any(current.get("config", {}).get(k) != v for k, v in changes.items()):
+            api.call("PUT", f"/components/{current['id']}", {
+                **current, "config": {**(current.get("config") or {}), **changes},
+            })
+
+    config = policies.get("allowed-client-templates", {}).get("config", {})
+    allowed = dict.fromkeys([*config.get("allowed-client-scopes", []), *DCR_SCOPES])
+    apply("allowed-client-templates", "Allowed Client Scopes", {
+        "allow-default-scopes": ["true"], "allowed-client-scopes": list(allowed),
+    })
+    hosts = [host.strip() for host in os.environ.get("KEYCLOAK_DCR_TRUSTED_HOSTS", "").split(",")
+             if host.strip()]
+    if hosts:
+        current = policies.get("trusted-hosts", {}).get("config", {})
+        apply("trusted-hosts", "Trusted Hosts", {
+            "trusted-hosts": list(dict.fromkeys([*current.get("trusted-hosts", []), *hosts])),
         })
+
+
+def _configure_dcr(api: AdminAPI) -> None:
+    scopes = _ensure_dcr_scopes(api)
+    basic = scopes["basic"]
+    defaults = "/default-default-client-scopes"
+    if not any(scope["id"] == basic for scope in api.call("GET", defaults)):
+        api.call("PUT", f"{defaults}/{basic}")
+    upsert_mapper(api, f"/client-scopes/{basic}/protocol-mappers/models", {
+        "name": "employee-id", "protocol": "openid-connect",
+        "protocolMapper": "oidc-usermodel-attribute-mapper",
+        "config": {"user.attribute": CLAIM, "claim.name": CLAIM, "jsonType.label": "String",
+                   "access.token.claim": "true", "id.token.claim": "false",
+                   "userinfo.token.claim": "false"},
+    })
+    endpoint = f"/client-scopes/{scopes['profile']}/protocol-mappers/models"
+    upsert_mapper(api, endpoint, {
+        "name": "mcp-gateway-audience", "protocol": "openid-connect",
+        "protocolMapper": "oidc-audience-mapper",
+        "config": {
+            "included.custom.audience": "mcp-gateway",
+            "access.token.claim": "true", "id.token.claim": "false",
+        },
+    })
+    upsert_mapper(api, endpoint, {
+        "name": "groups", "protocol": "openid-connect",
+        "protocolMapper": "oidc-group-membership-mapper",
+        "config": {
+            "full.path": "false", "claim.name": "groups",
+            "access.token.claim": "true",
+        },
+    })
+    _configure_registration(api)
 
 
 def configure(api: AdminAPI) -> None:
     profile = api.call("GET", "/users/profile")
+    original = deepcopy(profile)
     attributes = profile["attributes"]
     for item in attributes:
         if item["name"] in {"email", "firstName", "lastName"}:
@@ -181,8 +287,13 @@ def configure(api: AdminAPI) -> None:
         "permissions": {"view": ["admin"], "edit": ["admin"]},
         "multivalued": False,
     }
-    attributes[:] = [item for item in attributes if item["name"] != CLAIM] + [employee_attribute]
-    api.call("PUT", "/users/profile", profile)
+    current = next((item for item in attributes if item["name"] == CLAIM), None)
+    if current is None:
+        attributes.append(employee_attribute)
+    elif current.get("permissions") != employee_attribute["permissions"] or current.get("multivalued", False):
+        raise RuntimeError("Conflicting permissions or type for protected employee_id in Keycloak")
+    if profile != original:
+        api.call("PUT", "/users/profile", profile)
 
     upsert_mapper(api, "/identity-provider/instances/cas/mappers", {
         "name": "cas-employee-id",
@@ -245,11 +356,12 @@ def main() -> None:
         if options.if_missing and any(
             item["alias"] == "cas" for item in api.call("GET", "/identity-provider/instances")
         ):
-            print("CAS identity provider already configured.")
-            return
-        _configure_broker(api, options.signup_mode)
-        _configure_realm_defaults(api)
+            print("Existing CAS broker preserved.")
+        else:
+            _configure_broker(api, options.signup_mode)
+            _configure_realm_defaults(api)
         configure(api)
+        _configure_dcr(api)
         print("CAS login and employee claim configured; realm email login settings preserved.")
     else:
         bind_employee(api, options.employee_id, options.display_name)
