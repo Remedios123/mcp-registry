@@ -1,0 +1,128 @@
+# Docker Compose >= 2.24.4. Paths are relative to the upstream docker-compose.yml.
+x-browser: &browser
+  KEYCLOAK_EXTERNAL_URL: ${KEYCLOAK_EXTERNAL_URL:-${REGISTRY_URL}}
+  AUTH_SERVER_EXTERNAL_URL: ${AUTH_SERVER_EXTERNAL_URL:-${REGISTRY_URL}}
+  SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE}
+  MCP_OAUTH_AS_ON_GATEWAY_REALM: ${MCP_OAUTH_AS_ON_GATEWAY_REALM}
+  MCP_HTTPS_REQUIRED: ${MCP_HTTPS_REQUIRED}
+x-broker: &broker
+  SHIM_CLIENT_ID: ${SHIM_CLIENT_ID}
+  SHIM_CLIENT_SECRET: ${SHIM_CLIENT_SECRET:?required}
+  SHIM_BASE_URL: ${SHIM_BASE_URL}
+  SHIM_PUBLIC_URL: ${SHIM_PUBLIC_URL:-${REGISTRY_URL}}
+
+services:
+  registry:
+    image: local/mcp-registry:${BUILD_VERSION:?required}
+    ports: !override ["443:8080"]
+    depends_on:
+      cas-shim:
+        condition: service_healthy
+    environment:
+      <<: *browser
+      ENTERPRISE_CREDENTIAL_PROFILES: ${ENTERPRISE_CREDENTIAL_PROFILES}
+      ENTERPRISE_CREDENTIAL_SHIM_URL: ${ENTERPRISE_CREDENTIAL_SHIM_URL:-}
+      ENTERPRISE_CREDENTIAL_SHIM_PUBLIC_URL: ${ENTERPRISE_CREDENTIAL_SHIM_PUBLIC_URL:-}
+      SHIM_INTERNAL_TOKEN: ${SHIM_INTERNAL_TOKEN:?required}
+    # In particular do not mask the image's system CA bundle with an empty ssl directory.
+    volumes: !override
+      - /data/mcp-gateway/data/servers:/app/registry/servers
+      - /data/mcp-gateway/data/agents:/app/registry/agents
+      - /data/mcp-gateway/models:/app/registry/models:ro
+      - /data/mcp-gateway/config/federation.json:/app/config/federation.json:ro
+      - ./branding:/app/branding:ro
+      - /data/mcp-gateway/logs:/var/log/containers/ai-registry
+      - registry-logs:/app/logs
+      - registry-scans:/app/security_scans
+      - ./deploy/linux/.generated/nginx_rev_proxy_http_only.conf:/app/docker/nginx_rev_proxy_http_only.conf:ro
+      - ./deploy/linux/.generated/nginx_rev_proxy_http_and_https.conf:/app/docker/nginx_rev_proxy_http_and_https.conf:ro
+      - ./deploy/linux/cas-browser.conf:/etc/nginx/cas-browser.inc:ro
+  auth-server:
+    image: local/mcp-auth-server:${BUILD_VERSION}
+    environment: *browser
+    volumes:
+      - /data/mcp-gateway/logs:/var/log/containers/ai-registry
+  keycloak:
+    environment:
+      KC_HOSTNAME: ${KEYCLOAK_EXTERNAL_URL:-${REGISTRY_URL}}
+      KC_FRONTEND_URL: ${KEYCLOAK_EXTERNAL_URL:-${REGISTRY_URL}}
+  mcpgw-server:
+    image: local/mcpgw-server:${BUILD_VERSION}
+    environment:
+      REGISTRY_EXTERNAL_URL: ${REGISTRY_URL}
+      MCPGW_BASE_URL: ${MCPGW_BASE_URL:-${REGISTRY_URL}/airegistry-tools}
+      KEYCLOAK_INTERNAL_URL: ${KEYCLOAK_URL}
+      MCPGW_HTTP_ALLOWED_HOSTS: mcpgw-server
+    volumes:
+      - /data/mcp-gateway/models:/app/registry/models:ro
+      - /data/mcp-gateway/data/servers:/app/registry/servers
+      - /data/mcp-gateway/logs:/var/log/containers/ai-registry
+  metrics-service:
+    image: local/mcp-metrics-service:${BUILD_VERSION}
+    volumes:
+      - /data/mcp-gateway/logs:/var/log/containers/ai-registry
+  metrics-db:
+    image: local/mcp-metrics-db:${BUILD_VERSION}
+  cas-shim:
+    image: local/mcp-cas-shim:${BUILD_VERSION}
+    build:
+      context: .
+      dockerfile: deploy/linux/Dockerfile.cas-shim
+    restart: unless-stopped
+    environment:
+      <<: *broker
+      TZ: ${TZ}
+      CAS_SHIM_MOCK: ${CAS_SHIM_MOCK}
+      CAS_BASE: ${CAS_BASE}
+      UC_AUTH_URL: ${UC_AUTH_URL}
+      UC_REFRESH_URL: ${UC_REFRESH_URL}
+      UC_REFRESH_METHOD: ${UC_REFRESH_METHOD}
+      CAS_TLS_VERIFY: ${CAS_TLS_VERIFY}
+      CAS_CA_BUNDLE: ${CAS_CA_BUNDLE:-}
+      SHIM_CALLBACK_URL: ${SHIM_CALLBACK_URL:-${REGISTRY_URL}/cas/callback}
+      SHIM_ALLOWED_REDIRECT_URIS: ${SHIM_ALLOWED_REDIRECT_URIS:-${REGISTRY_URL}/realms/${KEYCLOAK_REALM}/broker/cas/endpoint}
+      SHIM_SIGNING_SECRET: ${SHIM_SIGNING_SECRET:?required}
+      SHIM_SIGNING_KEY_PATH: /var/lib/cas-shim/keys/signing_key.pem
+      SHIM_INTERNAL_TOKEN: ${SHIM_INTERNAL_TOKEN:?required}
+      SHIM_MONGO_URI: ${SHIM_MONGO_URI:?required}
+      SHIM_MONGO_DB: ${SHIM_MONGO_DB}
+      SHIM_MONGO_COLLECTION: ${SHIM_MONGO_COLLECTION}
+      BUSINESS_TOKEN_IDLE_LIMIT_HOURS: ${BUSINESS_TOKEN_IDLE_LIMIT_HOURS}
+      REFRESH_MARGIN_HOURS: ${REFRESH_MARGIN_HOURS}
+      REFRESH_BATCH_CRON: ${REFRESH_BATCH_CRON}
+      REFRESH_BATCH_RATE_PER_MINUTE: ${REFRESH_BATCH_RATE_PER_MINUTE}
+      NO_PROXY: ${NO_PROXY}
+    volumes:
+      - /data/mcp-gateway/data/shim-keys:/var/lib/cas-shim/keys
+      - /data/mcp-gateway/config/ca:/etc/company-ca:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8085/.well-known/openid-configuration', timeout=4).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+  enterprise-init:
+    profiles: ["setup"]
+    image: local/mcp-cas-shim:${BUILD_VERSION}
+    entrypoint: ["python", "/setup/bootstrap.py"]
+    environment:
+      <<: *broker
+      REGISTRY_URL: ${REGISTRY_URL}
+      KEYCLOAK_ADMIN_URL: ${KEYCLOAK_URL}
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM}
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:?required}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID}
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:?required}
+      KEYCLOAK_M2M_CLIENT_ID: ${KEYCLOAK_M2M_CLIENT_ID}
+      KEYCLOAK_M2M_CLIENT_SECRET: ${KEYCLOAK_M2M_CLIENT_SECRET:?required}
+      KEYCLOAK_DCR_TRUSTED_HOSTS: ${KEYCLOAK_DCR_TRUSTED_HOSTS:-}
+      DOCUMENTDB_USERNAME: ${DOCUMENTDB_USERNAME}
+      DOCUMENTDB_PASSWORD: ${DOCUMENTDB_PASSWORD}
+      SHIM_MONGO_URI: ${SHIM_MONGO_URI}
+      SHIM_MONGO_DB: ${SHIM_MONGO_DB}
+      SHIM_MONGO_COLLECTION: ${SHIM_MONGO_COLLECTION}
+    volumes:
+      - ./deploy/linux/bootstrap.py:/setup/bootstrap.py:ro
+      - ./keycloak/setup/configure-cas.py:/setup/configure-cas.py:ro
+      - ./keycloak/import/realm-config.json:/setup/realm.json:ro

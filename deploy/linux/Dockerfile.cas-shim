@@ -1,0 +1,11 @@
+FROM ghcr.io/astral-sh/uv:0.13.5 AS uv
+FROM python:3.14.9-slim
+WORKDIR /app
+COPY --from=uv /uv /usr/local/bin/uv
+COPY cas-shim/pyproject.toml cas-shim/uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project && uv cache clean
+COPY cas-shim/app.py ./
+RUN groupadd -g 1000 shim && useradd -u 1000 -g shim -m shim
+USER shim
+ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8085", "--workers", "1", "--no-access-log"]
