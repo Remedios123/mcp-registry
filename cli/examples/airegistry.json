@@ -1,6 +1,6 @@
 {
   "server_name": "AI Registry tools",
-  "description": "Provides tools to discover and list servers, agents, and skills in the AI Registry. Includes intelligent tool finder which uses semantic search to discover the most relevant tools across all registered services.",
+  "description": "Find and call enterprise tools you are authorized to use as the signed-in employee. Search in natural language in Chinese or English, for example 「有什么工具能查假期余额」. You can also discover and list MCP servers, agents, and skills in the AI Registry.",
   "path": "/airegistry-tools/",
   "proxy_pass_url": "http://mcpgw-server:8003/",
   "supported_transports": ["streamable-http"],

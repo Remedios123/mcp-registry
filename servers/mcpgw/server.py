@@ -303,11 +303,15 @@ async def _lifespan(_server: FastMCP) -> AsyncIterator[dict[str, Any]]:
 mcp = FastMCP(
     "AI Registry",
     instructions=(
-        "This server connects you to an AI Registry containing MCP servers, "
-        "tools, agents, and skills that you can discover and use. "
-        "Start with search_registry to find relevant AI assets by describing "
-        "what you need in natural language. Once you find a useful MCP server, "
-        "you can use its tools in one of two ways. "
+        "For employee business tasks, first use search_registry_tools to find "
+        "tools you are authorized to use by describing what you need in natural "
+        "language, then use invoke_tool with a result where callable=true. Pass "
+        "its server_path and tool_name. Use its schema_version for "
+        "expected_schema_version and its inputSchema to build arguments. "
+        "The gateway uses the signed-in employee identity for both steps. "
+        "For catalog discovery, start with search_registry to find MCP servers, "
+        "agents, or skills by describing what you need in natural language. Once "
+        "you find a useful MCP server, you can use its tools in one of two ways. "
         "The recommended way is to add the server to your MCP client, which then "
         "signs the user in with OAuth, so you never handle a token. For Claude "
         "Code: claude mcp add --transport http --scope user <name> <endpoint_url>. "
