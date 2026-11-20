@@ -5,6 +5,7 @@ __pycache__/
 
 # Models
 .models/
+/registry/models/bge-small-zh-v1.5/
 
 # C extensions
 *.so
