@@ -20,6 +20,7 @@ from registry.repositories.documentdb.search_repository import (
     REINDEX_NO_EMBEDDING_ERROR,
     DocumentDBSearchRepository,
     _reindex_detail,
+    embedding_config,
 )
 
 SERVER_INFO: dict = {
@@ -35,6 +36,7 @@ def _repo_with_collection() -> tuple[DocumentDBSearchRepository, MagicMock]:
     repo = DocumentDBSearchRepository.__new__(DocumentDBSearchRepository)
     collection = MagicMock()
     collection.find_one = AsyncMock(return_value=None)
+    collection.find.return_value = _cursor([])
     collection.replace_one = AsyncMock()
     collection.update_one = AsyncMock()
     repo._collection = collection
@@ -107,11 +109,14 @@ class TestIndexServerReturnValue:
         repo, collection = _repo_with_collection()
         with patch.object(repo, "_embed_texts", AsyncMock(return_value=[[0.1]])):
             await repo.index_server("/a", SERVER_INFO, is_enabled=True)
-        stored = collection.replace_one.await_args.args[1]
+        stored_server, stored_tool = (
+            call.args[1] for call in collection.replace_one.await_args_list
+        )
+        collection.find.return_value = _cursor([stored_tool])
         collection.find_one = AsyncMock(
             return_value={
-                "content_hash": stored["content_hash"],
-                "embedding": stored["embedding"],
+                "content_hash": stored_server["content_hash"],
+                "embedding": stored_server["embedding"],
                 "is_enabled": True,
             }
         )
@@ -197,3 +202,49 @@ class TestFindMissingEmbeddings:
         assert [m["path"] for m in result["missing"]] == ["/empty-vector"]
         assert result["total_indexed"] == 1
         assert result["total_source"] == 2
+
+    @pytest.mark.asyncio
+    async def test_reports_one_reindex_path_for_missing_or_incompatible_tools(self):
+        repo, collection = _repo_with_collection()
+        metadata = embedding_config.get_embedding_metadata()
+        source_docs = [
+            {"_id": "/partial", "tool_list": [{"name": "kept"}, {"name": "absent"}, {"name": "empty"}]},
+            {"_id": "/stale-model", "tool_list": [{"name": "lookup"}]},
+            {"_id": "/complete", "tool_list": [{"name": "lookup"}]},
+            {"_id": "/local", "deployment": "local", "tool_list": [{"name": "no-vector"}]},
+            {"_id": "/no-parent-vector", "tool_list": [{"name": "lookup"}]},
+        ]
+        indexed_docs = [
+            {"_id": "/partial"},
+            {"_id": "/stale-model"},
+            {"_id": "/complete"},
+            {"_id": "/local"},
+            {"_id": "/partial::kept", "embedding_metadata": metadata},
+            {"_id": "/stale-model::lookup", "embedding_metadata": {**metadata, "model": "old-model"}},
+            {"_id": "/complete::lookup", "embedding_metadata": metadata},
+        ]
+        # /partial::empty also has a stored document, with an empty embedding;
+        # like an absent document, it is not returned by the has-vector filter.
+        collection.find = MagicMock(return_value=_cursor(indexed_docs))
+        servers = MagicMock()
+        servers.find.return_value = _cursor(source_docs)
+        empty = MagicMock()
+        empty.find.return_value = _cursor([])
+        db = MagicMock()
+        db.__getitem__.side_effect = lambda name: servers if "mcp_servers" in name else empty
+
+        with patch(
+            "registry.repositories.documentdb.search_repository.get_documentdb_client",
+            AsyncMock(return_value=db),
+        ):
+            result = await repo.find_missing_embeddings()
+
+        assert [entry["path"] for entry in result["missing"]] == [
+            "/no-parent-vector",
+            "/partial",
+            "/stale-model",
+        ]
+        assert all(entry["entity_type"] == "mcp_server" for entry in result["missing"])
+        assert result["total_missing"] == 3
+        assert result["total_source"] == len(source_docs)
+        assert result["total_indexed"] == len(indexed_docs)

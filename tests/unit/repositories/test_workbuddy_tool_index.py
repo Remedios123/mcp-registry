@@ -4,7 +4,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from registry.repositories.documentdb.search_repository import DocumentDBSearchRepository
+from registry.repositories.documentdb.search_repository import (
+    DocumentDBSearchRepository,
+    embedding_config,
+)
 
 
 @pytest.fixture
@@ -84,3 +87,22 @@ async def test_client_side_search_finds_tool_independent_of_parent():
     assert result["tools"][0]["inputSchema"] == {}
     fields = collection.find.call_args.args[1]
     assert all(fields.get(key) == 1 for key in ("server_path", "server_name", "inputSchema"))
+
+
+@pytest.mark.asyncio
+async def test_sync_reembeds_tool_when_model_changes_at_same_dimension(indexed_documents, monkeypatch):
+    docs, collection = indexed_documents
+    repo = DocumentDBSearchRepository()
+    repo._embed_with_trim_retry = AsyncMock(side_effect=[[1.0, 0.0], [0.0, 1.0]])
+    server = {"tool_list": [{"name": "lookup", "description": "Lookup an employee"}]}
+    old_metadata = embedding_config.get_embedding_metadata()
+    new_metadata = {**old_metadata, "model": "different-embedding-model"}
+
+    await repo._sync_tool_docs(collection, "/hr", server, is_enabled=True)
+    monkeypatch.setattr(embedding_config, "get_embedding_metadata", lambda: new_metadata)
+    await repo._sync_tool_docs(collection, "/hr", server, is_enabled=True)
+
+    entry = docs["/hr::lookup"]
+    assert entry["embedding"] == [0.0, 1.0]
+    assert entry["embedding_metadata"]["model"] == new_metadata["model"]
+    assert repo._embed_with_trim_retry.await_count == 2

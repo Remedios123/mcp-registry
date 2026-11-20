@@ -86,6 +86,26 @@ REINDEX_NO_EMBEDDING_ERROR: str = (
 HAS_VECTOR_FILTER: dict[str, Any] = {"embedding": {"$nin": [None, []]}}
 
 
+def _uses_embedding_model(document: dict[str, Any], current_metadata: dict[str, Any]) -> bool:
+    """Check the model identity without comparing the embedding's timestamp."""
+    metadata = document.get("embedding_metadata")
+    return isinstance(metadata, dict) and all(
+        metadata.get(key) == current_metadata[key] for key in ("provider", "model", "dimensions")
+    )
+
+
+def _standalone_tools_by_id(path: str, server: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return the remote tools that should have their own search documents."""
+    if server.get("deployment") == "local":
+        return {}
+
+    tools = {}
+    for tool in server.get("tool_list") or []:
+        if isinstance(tool, dict) and (name := tool.get("name")):
+            tools[f"{path}::{name}"] = tool
+    return tools
+
+
 def _reindex_detail(
     path: str,
     entity_type: str,
@@ -1198,12 +1218,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         import hashlib
 
         tool_filter = {"entity_type": "mcp_tool", "server_path": path}
-        new_tools = {}
-        if server_info.get("deployment") != "local":
-            for tool in server_info.get("tool_list") or []:
-                name = tool.get("name")
-                if name:
-                    new_tools[f"{path}::{name}"] = tool
+        new_tools = _standalone_tools_by_id(path, server_info)
 
         existing = {
             doc["_id"]: doc
@@ -1214,6 +1229,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             await collection.delete_many({"_id": {"$in": stale_ids}})
 
         complete = True
+        current_metadata = embedding_config.get_embedding_metadata()
         for tool_id, tool in new_tools.items():
             name = tool["name"]
             description = tool.get("description") or ""
@@ -1226,10 +1242,17 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             content_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
             previous = existing.get(tool_id, {})
             embedding = previous.get("embedding")
-            if previous.get("content_hash") != content_hash or not embedding:
+            if (
+                previous.get("content_hash") != content_hash
+                or not embedding
+                or not _uses_embedding_model(previous, current_metadata)
+            ):
                 embedding = await self._embed_with_trim_retry(
                     embedding_text, context=f"tool {path}/{name}"
                 )
+                metadata = current_metadata
+            else:
+                metadata = previous["embedding_metadata"]
 
             doc = {
                 "_id": tool_id,
@@ -1246,7 +1269,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                 "text_for_embedding": text,
                 "content_hash": content_hash,
                 "embedding": embedding,
-                "embedding_metadata": embedding_config.get_embedding_metadata(),
+                "embedding_metadata": metadata,
                 "indexed_at": server_info.get("updated_at", server_info.get("registered_at")),
             }
             if doc != previous:
@@ -1796,8 +1819,9 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
 
         Compares _id values across mcp_servers, mcp_agents, and agent_skills
         collections against the embeddings collection. A record stored with an
-        empty vector (its embedding call failed) counts as missing, so a reindex
-        driven by this list retries it.
+        empty vector (its embedding call failed) counts as missing. A remote
+        server with a missing or incompatible tool vector is listed once by
+        server path, which lets the reindex endpoint rebuild that server's tools.
 
         Returns:
             Dictionary with missing list, counts, and summary.
@@ -1811,25 +1835,35 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         ]
 
         embeddings_collection = await self._get_collection()
-        indexed_cursor = embeddings_collection.find(HAS_VECTOR_FILTER, {"_id": 1})
+        indexed_cursor = embeddings_collection.find(
+            HAS_VECTOR_FILTER, {"_id": 1, "embedding_metadata": 1}
+        )
         indexed_docs = await indexed_cursor.to_list(length=None)
         indexed_ids = {doc["_id"] for doc in indexed_docs}
+        current_metadata = embedding_config.get_embedding_metadata()
+        current_model_ids = {
+            doc["_id"] for doc in indexed_docs if _uses_embedding_model(doc, current_metadata)
+        }
 
         missing = []
         total_source = 0
 
         for col_name, entity_type in source_collections:
             collection = db[col_name]
-            cursor = collection.find(
-                {},
-                {"_id": 1, "server_name": 1, "name": 1, "is_enabled": 1},
-            )
+            projection = {"_id": 1, "server_name": 1, "name": 1, "is_enabled": 1}
+            if entity_type == "mcp_server":
+                projection.update({"deployment": 1, "tool_list.name": 1})
+            cursor = collection.find({}, projection)
             source_docs = await cursor.to_list(length=None)
             total_source += len(source_docs)
 
             for doc in source_docs:
                 doc_id = doc["_id"]
-                if doc_id not in indexed_ids:
+                has_missing_tools = (
+                    entity_type == "mcp_server"
+                    and not _standalone_tools_by_id(doc_id, doc).keys() <= current_model_ids
+                )
+                if doc_id not in indexed_ids or has_missing_tools:
                     name = doc.get("server_name") or doc.get("name") or doc_id
                     missing.append(
                         {
