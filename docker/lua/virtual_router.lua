@@ -74,6 +74,8 @@ local META_PROTOCOL_VERSION_KEY = "io.modelcontextprotocol/protocolVersion"
 local META_CLIENT_INFO_KEY = "io.modelcontextprotocol/clientInfo"
 local META_CLIENT_CAPABILITIES_KEY = "io.modelcontextprotocol/clientCapabilities"
 local META_SERVER_INFO_KEY = "io.modelcontextprotocol/serverInfo"
+-- Every 2026-07-28 _meta key above shares this prefix.
+local MODERN_META_PREFIX = "io.modelcontextprotocol/"
 local JSONRPC_METHOD_NOT_FOUND = -32601
 local JSONRPC_INVALID_PARAMS = -32602
 local JSONRPC_HEADER_MISMATCH = -32020
@@ -620,7 +622,9 @@ local function _append_mapping_tools_for_backend(enriched_tools, mapping, backen
 
     for _, tool in ipairs(mapping.tools) do
         if tool.backend_location == backend_location then
-            enriched_tools[#enriched_tools + 1] = {
+            -- The mapping file carries the backend tool's stored title,
+            -- annotations and outputSchema, so the fallback list keeps them.
+            enriched_tools[#enriched_tools + 1] = _copy_tool_fields(tool, {
                 name = tool.name,
                 original_name = tool.original_name or tool.name,
                 backend_server_path = tool.backend_server_path,
@@ -628,7 +632,7 @@ local function _append_mapping_tools_for_backend(enriched_tools, mapping, backen
                 description = tool.description or "",
                 inputSchema = _ensure_mcp_schema(tool.inputSchema),
                 required_scopes = tool.required_scopes,
-            }
+            })
         end
     end
 end
@@ -972,9 +976,82 @@ local function _absorb_modern_tool_list(backend_loc, tools)
 end
 
 
+-- Remove the 2026-07-28 "io.modelcontextprotocol/*" keys from params._meta.
+-- A handshake-era backend negotiated an older version in initialize, and the
+-- router does not send it the MCP-Protocol-Version header (it clears the
+-- client's 2026-07-28 copy). Leaving the client's version marker in the body
+-- makes a strict backend reject the call with -32020 ("Mcp-Protocol-Version
+-- header is required"). Other _meta keys, such as progressToken, are kept.
+local function _strip_modern_meta(params)
+    if type(params) ~= "table" or type(params._meta) ~= "table" then
+        return
+    end
+    local kept = {}
+    local has_kept = false
+    for key, value in pairs(params._meta) do
+        if type(key) ~= "string" or key:sub(1, #MODERN_META_PREFIX) ~= MODERN_META_PREFIX then
+            kept[key] = value
+            has_kept = true
+        end
+    end
+    if has_kept then
+        params._meta = kept
+    else
+        params._meta = nil
+    end
+end
+
+
+-- Text that appears in any body carrying a 2026-07-28 _meta key. It omits the
+-- "/" of MODERN_META_PREFIX because cjson encodes "/" as "\/".
+local MODERN_META_TEXT = "io.modelcontextprotocol"
+
+
+-- Return the body to send a handshake-era backend: the same request without
+-- the 2026-07-28 _meta keys. The plain-text check skips the decode for the
+-- router's own requests (discovery lists), which never carry them.
+local function _legacy_backend_body(body)
+    if type(body) ~= "string" or not body:find(MODERN_META_TEXT, 1, true) then
+        return body
+    end
+    local ok, request = pcall(cjson.decode, body)
+    if not ok or type(request) ~= "table" or type(request.params) ~= "table" then
+        return body
+    end
+    _strip_modern_meta(request.params)
+    return cjson.encode(request)
+end
+
+
+-- A 400 is retried with fresh session state only when its body is about the
+-- session: MCP SDKs answer a missing or unknown session ID with 400 ("Bad
+-- Request: Missing session ID", "Server not initialized"). Any other 400 (a
+-- validation error such as -32020) would fail the same way after a re-initialize.
+local SESSION_400_MARKERS = { "session", "initializ" }
+
+
+-- Whether a backend response means its session state was rejected (404/410
+-- always; 400 only with a session-related body).
+local function _is_session_rejection(res)
+    if res.status == 404 or res.status == 410 then
+        return true
+    end
+    if res.status ~= 400 or type(res.body) ~= "string" then
+        return false
+    end
+    local text = res.body:lower()
+    for _, marker in ipairs(SESSION_400_MARKERS) do
+        if text:find(marker, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+
 -- Send one JSON-RPC request to a backend: authorize the exact body, resolve
 -- the session state, dispatch, and retry once with fresh state when the
--- backend rejects the session (HTTP 400/404/410).
+-- backend rejects the session (HTTP 404/410, or a session-related 400).
 --
 -- The body is authorized before any initialize (a caller without the grant
 -- never initializes the backend). An initialize authorizes its own body and
@@ -994,6 +1071,8 @@ local function _call_backend(backend_loc, body, client_session_id, server_id, ba
     if _backend_era(backend_loc, backend_version) == ERA_MODERN then
         return _call_modern_backend(backend_loc, body, param_headers)
     end
+    -- Clean the body before authorize(), so /validate checks the bytes sent.
+    body = _legacy_backend_body(body)
     -- Returns session_id, outcome, pre_consent, and whether an initialize ran
     -- (it authorized its own body, replacing the request's token).
     local function resolve()
@@ -1059,8 +1138,7 @@ local function _call_backend(backend_loc, body, client_session_id, server_id, ba
 
     -- Only session-related statuses trigger one fresh-state retry; auth errors
     -- never cause a second initialize or credential vend.
-    if res and client_session_id and not pre_consent
-        and (res.status == 400 or res.status == 404 or res.status == 410) then
+    if res and client_session_id and not pre_consent and _is_session_rejection(res) then
         ngx.log(ngx.WARN, "Backend session state rejected (", res.status, ") for ",
             backend_loc, " -- retrying with fresh state")
         _invalidate_backend_session(client_session_id, backend_loc, backend_version)
@@ -2500,6 +2578,8 @@ if _G._VR_TEST then
     _M._x_mcp_header_entries = _x_mcp_header_entries
     _M._param_headers = _param_headers
     _M._call_backend = _call_backend
+    _M._strip_modern_meta = _strip_modern_meta
+    _M._is_session_rejection = _is_session_rejection
     return _M
 end
 

@@ -127,6 +127,17 @@ MAX_WITHHELD_ITEMS: int = 5
 # so this asks for everything in one call rather than paginating.
 LIST_PAGE_LIMIT: int = 2000
 
+# MCP tool annotations (https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
+# Every tool here only reads from the registry: none changes a record, calling
+# one twice has the same effect, and none reaches past the registry itself.
+# Clients use these hints to decide whether to ask a person before a call.
+READ_ONLY_TOOL_ANNOTATIONS: dict[str, bool] = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+}
+
 logger.info(f"Registry URL: {REGISTRY_URL}")
 if REGISTRY_EXTERNAL_URL:
     logger.info(f"Registry External URL: {REGISTRY_EXTERNAL_URL}")
@@ -636,7 +647,7 @@ async def _get_registry_headers(ctx: Context | None) -> dict[str, str]:
     return headers
 
 
-@mcp.tool()
+@mcp.tool(title="List MCP servers", annotations=READ_ONLY_TOOL_ANNOTATIONS)
 @track_tool()
 async def list_services(
     metadata_fields: str | None = None,
@@ -726,7 +737,7 @@ async def list_services(
         }
 
 
-@mcp.tool()
+@mcp.tool(title="List A2A agents", annotations=READ_ONLY_TOOL_ANNOTATIONS)
 @track_tool()
 async def list_agents(
     metadata_fields: str | None = None,
@@ -810,7 +821,7 @@ async def list_agents(
         }
 
 
-@mcp.tool()
+@mcp.tool(title="List skills", annotations=READ_ONLY_TOOL_ANNOTATIONS)
 @track_tool()
 async def list_skills(
     metadata_fields: str | None = None,
@@ -905,7 +916,7 @@ async def list_skills(
         }
 
 
-@mcp.tool()
+@mcp.tool(title="Get skill content", annotations=READ_ONLY_TOOL_ANNOTATIONS)
 @track_tool()
 async def get_skill_content(
     skill_name: str,
@@ -1048,7 +1059,7 @@ async def get_skill_content(
         return {"skill_name": skill_name, "error": str(e), "status": "failed"}
 
 
-@mcp.tool()
+@mcp.tool(title="Get custom entity record", annotations=READ_ONLY_TOOL_ANNOTATIONS)
 @track_tool()
 async def get_custom_entity(
     path: str,
@@ -1133,7 +1144,7 @@ async def get_custom_entity(
         return {"path": path, "error": str(e), "status": "failed"}
 
 
-@mcp.tool()
+@mcp.tool(title="Search the registry", annotations=READ_ONLY_TOOL_ANNOTATIONS)
 @track_tool()
 async def search_registry(
     query: str,
@@ -1396,7 +1407,7 @@ async def search_registry(
         }
 
 
-@mcp.tool()
+@mcp.tool(title="Find tools (deprecated)", annotations=READ_ONLY_TOOL_ANNOTATIONS)
 @track_tool()
 async def intelligent_tool_finder(
     query: str,
@@ -1524,7 +1535,7 @@ async def intelligent_tool_finder(
         }
 
 
-@mcp.tool()
+@mcp.tool(title="Registry health check", annotations=READ_ONLY_TOOL_ANNOTATIONS)
 @track_tool()
 async def healthcheck(ctx: Context | None = None) -> dict[str, Any]:
     """

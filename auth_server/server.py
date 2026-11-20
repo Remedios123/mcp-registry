@@ -52,7 +52,16 @@ from internal_request_token import (
     verify_mcp_proxy_token,
 )
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from jsonrpc_body import (
+    AmbiguousJsonRpcBodyError,
+    parse_jsonrpc_body,
+)
 from jwt.api_jwk import PyJWK
+from mcp_apps_domain import RESOURCES_READ_METHOD as MCP_APPS_RESOURCES_READ_METHOD
+from mcp_apps_domain import claude_ui_domain as mcp_apps_claude_ui_domain
+from mcp_apps_domain import connector_url as mcp_apps_connector_url
+from mcp_apps_domain import gateway_public_origins as mcp_apps_gateway_public_origins
+from mcp_apps_domain import rewrite_ui_domains as mcp_apps_rewrite_ui_domains
 from metrics_middleware import add_auth_metrics_middleware
 from starlette.background import BackgroundTask
 
@@ -101,6 +110,7 @@ except ImportError:
 
 # Import provider factory
 from providers.base import normalize_groups_claim
+from providers.cognito import resolve_cognito_domain_prefix
 from providers.factory import get_auth_provider
 from pydantic import (
     BaseModel,
@@ -151,7 +161,11 @@ from registry.exceptions import UrlValidationError
 from registry.repositories.factory import get_scope_repository, get_server_repository
 from registry.utils.logging_setup import setup_logging as _setup_logging
 from registry.utils.request_utils import get_client_ip
-from registry.utils.url_guard import PROXY_PROFILE, guarded_async_client
+from registry.utils.url_guard import (
+    PROXY_PROFILE,
+    guarded_async_client,
+    is_builtin_airegistry_tools_outbound_url,
+)
 
 # Let setup_logging resolve the file path from settings.log_dir /
 # {service_name}.log. Honors APP_LOG_DIR overrides and the new
@@ -4517,6 +4531,12 @@ async def validate_request(request: Request):
         # to the unprivileged "initialize" method (that would authorize a body
         # whose real method we could not read) -- fail closed below instead.
         body_parse_failed = False
+        # True when the body was refused because a case-insensitive backend
+        # decoder could read it differently than this check does (ambiguous or
+        # duplicate keys). Kept separate from body_parse_failed so the refusal
+        # returns a clean 403 the client can read, not a 400 that nginx
+        # auth_request collapses to an opaque 500 (issue tracked separately).
+        body_ambiguous = False
         try:
             if body:
                 payload_text = body  # .decode('utf-8')
@@ -4525,7 +4545,9 @@ async def validate_request(request: Request):
                 # credentials, API keys, or PII. Log only the size and, once
                 # parsed, the non-sensitive method name + request id.
                 logger.debug("Request payload received (%d chars)", len(payload_text))
-                request_payload = json.loads(payload_text)
+                # Strict parse: a body a case-insensitive backend decoder would
+                # read differently from Python is refused, not authorized.
+                request_payload = parse_jsonrpc_body(payload_text)
                 if logger.isEnabledFor(logging.DEBUG) and isinstance(request_payload, dict):
                     logger.debug(
                         "JSON-RPC request: method=%s id=%s",
@@ -4537,6 +4559,9 @@ async def validate_request(request: Request):
         except UnicodeDecodeError as e:
             logger.warning(f"Could not decode body as UTF-8: {e}")
             body_parse_failed = True
+        except AmbiguousJsonRpcBodyError as e:
+            logger.warning(f"Refusing JSON-RPC payload with ambiguous keys: {e}")
+            body_ambiguous = True
         except json.JSONDecodeError as e:
             logger.warning(f"Could not parse JSON RPC payload: {e}")
             body_parse_failed = True
@@ -5236,6 +5261,25 @@ async def validate_request(request: Request):
                         "Request body too large to authorize; scope validation "
                         "requires an in-memory body"
                     ),
+                    headers={"Connection": "close"},
+                )
+
+            # Fail closed on an ambiguous body (a case-insensitive backend could
+            # read it as a different call than this check does). Deny with 403 so
+            # the client gets a clean denial: nginx auth_request forwards 403 but
+            # collapses 400 to an opaque 500. The payload is unparseable here, so
+            # no JSON-RPC error body is attached and nginx returns its plain 403.
+            if body_ambiguous:
+                logger.warning(
+                    "Access denied for user %s to %s - request body is ambiguous "
+                    "(keys a case-insensitive backend could read differently); "
+                    "failing closed",
+                    hash_username(validation_result.get("username", "")),
+                    server_name,
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail="Request body could not be authorized",
                     headers={"Connection": "close"},
                 )
 
@@ -6777,15 +6821,9 @@ def auto_derive_cognito_domain(user_pool_id: str) -> str:
     """
     Auto-derive Cognito domain from User Pool ID.
 
-    Example: us-east-1_KmP5A3La3 → us-east-1kmp5a3la3
+    Example: us-east-1_KmP5A3La3 becomes us-east-1kmp5a3la3
     """
-    if not user_pool_id:
-        return ""
-
-    # Remove underscore and convert to lowercase
-    domain = user_pool_id.replace("_", "").lower()
-    logger.info(f"Auto-derived Cognito domain '{domain}' from user pool ID '{user_pool_id}'")
-    return domain
+    return resolve_cognito_domain_prefix(None, user_pool_id)
 
 
 def substitute_env_vars(config):
@@ -6798,13 +6836,13 @@ def substitute_env_vars(config):
         try:
             # Handle special case for auto-derived Cognito domain
             if "COGNITO_DOMAIN:-auto" in config:
-                # Check if COGNITO_DOMAIN is set, if not auto-derive from user pool ID
-                cognito_domain = os.environ.get("COGNITO_DOMAIN")
-                if not cognito_domain:
-                    user_pool_id = os.environ.get("COGNITO_USER_POOL_ID", "")
-                    cognito_domain = auto_derive_cognito_domain(user_pool_id)
-
-                # Replace the template with the derived domain
+                # Same resolution as the Cognito provider, so the browser login
+                # URLs and the provider's own endpoints agree. Empty, unset and
+                # "auto" all derive the prefix from the user pool id.
+                cognito_domain = resolve_cognito_domain_prefix(
+                    os.environ.get("COGNITO_DOMAIN"),
+                    os.environ.get("COGNITO_USER_POOL_ID", ""),
+                )
                 config = config.replace("${COGNITO_DOMAIN:-auto}", cognito_domain)
 
             template = Template(config)
@@ -8355,6 +8393,37 @@ async def _read_bounded(
 # servers that need an upstream credential use the egress vault.
 _INTERNAL_INGRESS_RELAY_SERVERS: frozenset[str] = frozenset({"airegistry-tools"})
 
+
+def _relays_ingress_auth(
+    registered_server: str,
+    upstream_url: str | None,
+) -> bool:
+    """Return whether this MCP proxy hop may relay the caller's ingress bearer.
+
+    Both the signed server name and the signed upstream URL must be the
+    built-in registry-tools server. The name alone is not enough: an admin can
+    repoint the /airegistry-tools/ registration, and the caller's token must
+    not follow it to another host.
+
+    Args:
+        registered_server: The verified ``server`` claim (case-preserving).
+        upstream_url: The verified ``upstream_url`` claim, before any route
+            suffix is appended.
+
+    Returns:
+        True only for the exact built-in name and destination.
+    """
+    if registered_server.lower() not in _INTERNAL_INGRESS_RELAY_SERVERS:
+        return False
+    if is_builtin_airegistry_tools_outbound_url(upstream_url):
+        return True
+    logger.warning(
+        "mcp_proxy: server=%s is not at the built-in destination; not relaying the caller's token",
+        registered_server,
+    )
+    return False
+
+
 # Proxy-context headers describe the client -> Gateway hop (scheme, host, port,
 # path prefix as seen by nginx/an ingress LB) and must not be copied onto the
 # separate Gateway -> upstream MCP server hop; an upstream that trusts them can
@@ -9783,6 +9852,10 @@ async def _authorize_forwarded_mcp_body(
         unauthenticated-for-this-server caller is still denied.
       * ``tools/call`` requires the specific tool named in ``params.name`` to
         be allowed; a missing/blank tool name is rejected.
+      * A body with a repeated key, or with an envelope or ``params`` key that
+        a case-insensitive decoder would read as a different member, is
+        rejected (``parse_jsonrpc_body``): the backend could run a call other
+        than the one authorized here.
 
     Args:
         registered_server: The path verified in the signed proxy token;
@@ -9805,11 +9878,11 @@ async def _authorize_forwarded_mcp_body(
 
     if request_body:
         try:
-            payload = json.loads(request_body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            payload = parse_jsonrpc_body(request_body)
+        except (UnicodeDecodeError, json.JSONDecodeError, AmbiguousJsonRpcBodyError) as exc:
             logger.warning(
                 "mcp_proxy: rejecting forwarded body for server=%s that is not "
-                "parseable JSON-RPC (cannot authorize): %s",
+                "unambiguous JSON-RPC (cannot authorize): %s",
                 registered_server,
                 exc,
             )
@@ -9944,10 +10017,13 @@ async def mcp_proxy(
     incoming_payload: object = None
     try:
         if request_body:
-            incoming_payload = json.loads(request_body.decode("utf-8"))
+            incoming_payload = parse_jsonrpc_body(request_body)
             if isinstance(incoming_payload, dict):
                 incoming_method = incoming_payload.get("method")
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, AmbiguousJsonRpcBodyError):
+        # The forwarded-body check below refuses an ambiguous body; leave the
+        # payload unset so the consent-retry rewrite never re-serializes it.
+        incoming_payload = None
         incoming_method = None
     except Exception as exc:
         logger.debug(f"mcp_proxy: could not parse incoming body as JSON-RPC: {exc}")
@@ -9978,7 +10054,9 @@ async def mcp_proxy(
     # ``registered_server`` stays the case-preserving claim: it is the identity
     # /validate authorized, and scope matching is case-sensitive. Only the relay
     # allowlist lookup is case-folded.
-    relay_ingress_auth = registered_server.lower() in _INTERNAL_INGRESS_RELAY_SERVERS
+    # The destination check uses the signed claim, not ``upstream_url``, which
+    # may already carry a route suffix appended above.
+    relay_ingress_auth = _relays_ingress_auth(registered_server, claims["upstream_url"])
     forward_headers = _forward_headers(
         dict(request.headers),
         relay_authorization=relay_ingress_auth,
@@ -10536,6 +10614,16 @@ async def mcp_proxy(
             server_name,
         )
 
+    if _should_rewrite_mcp_apps_ui_domain(direct_route, incoming_method, status_code):
+        # MCP Apps: Claude shows a page only when its ui.domain matches the URL the
+        # user connected to, which is the gateway's, not the backend's.
+        body_bytes = _rewrite_mcp_apps_ui_domain(
+            body_bytes,
+            is_sse_response,
+            server_name,
+            request.url.query,
+        )
+
     if not should_filter:
         # Forward the upstream body and content_type unchanged. Many MCP
         # servers reply with text/event-stream (SSE) rather than plain JSON;
@@ -10598,6 +10686,61 @@ async def mcp_proxy(
         parsed["result"] = result
 
     return JSONResponse(content=parsed, status_code=status_code, headers=response_headers)
+
+
+def _should_rewrite_mcp_apps_ui_domain(
+    direct_route: bool,
+    method: str | None,
+    status_code: int,
+) -> bool:
+    """Return True for a reply whose MCP Apps ui.domain should be rewritten.
+
+    Only successful resources/read replies on a direct route. On a virtual
+    server's backend hop the client connected to the virtual URL, which this
+    hop does not know, so the value is left alone.
+    """
+    if not direct_route:
+        return False
+    if method != MCP_APPS_RESOURCES_READ_METHOD:
+        return False
+    return 200 <= status_code < 300
+
+
+def _rewrite_mcp_apps_ui_domain(
+    body_bytes: bytes,
+    is_sse: bool,
+    route_path: str,
+    query: str,
+) -> bytes:
+    """Point a resources/read page's Claude ui.domain at the gateway URL.
+
+    Returns the body unchanged when no public gateway URL is configured or the
+    reply has no Claude-format ui.domain. See auth_server/mcp_apps_domain.py.
+
+    Args:
+        body_bytes: The upstream reply body.
+        is_sse: True when the reply is text/event-stream.
+        route_path: The path after the gateway origin, as nginx forwarded it.
+        query: The request's query string.
+
+    Returns:
+        The body to forward.
+    """
+    origins = mcp_apps_gateway_public_origins()
+    if not origins:
+        return body_bytes
+    urls = [mcp_apps_connector_url(origin, route_path, query) for origin in origins]
+    keep_domains = frozenset(mcp_apps_claude_ui_domain(url) for url in urls)
+    rewritten = mcp_apps_rewrite_ui_domains(
+        body_bytes,
+        is_sse,
+        mcp_apps_claude_ui_domain(urls[0]),
+        keep_domains,
+    )
+    if rewritten is None:
+        return body_bytes
+    logger.info(f"mcp_proxy: rewrote MCP Apps ui.domain for {redact_url(urls[0])}")
+    return rewritten
 
 
 def _safe_parse_body(

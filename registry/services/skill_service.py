@@ -58,6 +58,7 @@ from ..utils.url_guard import (
     validate_url as _validate_url_guard,
 )
 from ..utils.url_utils import (
+    GIT_COMMIT_SHA_PATTERN,
     extract_repository_url,
     translate_skill_url,
 )
@@ -246,6 +247,8 @@ _LANG_BY_EXT: dict[str, str] = {
 # enterprise GitHub instances mirror the public path layout.
 _BLOB_PATH_PATTERN = re.compile(r"^/([^/]+)/([^/]+)/blob/([^/]+)/(.+)$")
 _RAW_PATH_PATTERN = re.compile(r"^/([^/]+)/([^/]+)/refs/heads/([^/]+)/(.+)$")
+# A raw URL pinned to a commit has the SHA where refs/heads/{branch} would be.
+_RAW_COMMIT_PATH_PATTERN = re.compile(rf"^/([^/]+)/([^/]+)/({GIT_COMMIT_SHA_PATTERN})/(.+)$")
 
 
 def _api_base_for_skill_host(
@@ -281,7 +284,8 @@ def _resolve_tree_api(
     """Resolve the GitHub/GHES Trees API endpoint for a SKILL.md URL.
 
     Parses both blob-style URLs (``github.com/{owner}/{repo}/blob/{ref}/...``)
-    and raw-content URLs (``raw.githubusercontent.com/{owner}/{repo}/refs/heads/{ref}/...``),
+    and raw-content URLs (``raw.githubusercontent.com/{owner}/{repo}/refs/heads/{ref}/...``,
+    or ``.../{owner}/{repo}/{commit sha}/...`` for a URL pinned to a commit),
     plus the corresponding GHES variants.
 
     Returns:
@@ -292,7 +296,7 @@ def _resolve_tree_api(
         - ``encoded_project``: ``{owner}/{repo}`` (kept for backward compat
           with the documented contract; GitHub's API uses owner+repo
           separately so callers can ignore this).
-        - ``ref``: branch name resolved from the SKILL.md URL.
+        - ``ref``: branch name or commit SHA resolved from the SKILL.md URL.
         - ``skill_dir``: directory portion of the path leading up to
           ``SKILL.md`` (``""`` when SKILL.md is at the repo root).
     """
@@ -313,7 +317,11 @@ def _resolve_tree_api(
     if not hostname:
         return None
 
-    match = _BLOB_PATH_PATTERN.match(parsed.path) or _RAW_PATH_PATTERN.match(parsed.path)
+    match = (
+        _BLOB_PATH_PATTERN.match(parsed.path)
+        or _RAW_PATH_PATTERN.match(parsed.path)
+        or _RAW_COMMIT_PATH_PATTERN.match(parsed.path)
+    )
     if not match:
         return None
 
@@ -1000,6 +1008,8 @@ async def _compute_content_integrity(
         url: str,
         rel_path: str,
     ) -> FileHash | None:
+        if not _is_safe_url(url):
+            return None
         fetch_url, fetch_headers = _build_fetch_headers(
             url,
             auth_scheme,
@@ -1007,12 +1017,22 @@ async def _compute_content_integrity(
             auth_header_name,
         )
         try:
+            if auth_scheme == "global_credentials":
+                fetch_headers = await _github_auth.get_auth_headers(
+                    fetch_url, allow_global_credentials=True
+                )
             resp = await client.get(
                 fetch_url,
                 headers=fetch_headers,
                 follow_redirects=True,
                 timeout=URL_VALIDATION_TIMEOUT,
             )
+            unsafe_hop = _unsafe_redirect_target(resp)
+            if unsafe_hop is not None:
+                logger.warning(
+                    "Integrity fetch blocked unsafe redirect to %s", redact_url(unsafe_hop)
+                )
+                return None
             if resp.status_code >= 400:
                 logger.warning("Integrity fetch failed for %s: HTTP %s", rel_path, resp.status_code)
                 return None
@@ -1054,6 +1074,40 @@ async def _compute_content_integrity(
         composite_hash=composite_hash,
         file_hashes=file_hashes,
         computed_at=datetime.now(UTC),
+    )
+
+
+async def _refresh_skill_content(
+    existing: SkillCard,
+    updates: dict[str, Any],
+) -> None:
+    """Validate replacement content and refresh its derived state before saving."""
+    merged = existing.model_copy(update=updates)
+    _, raw_url = translate_skill_url(str(merged.skill_md_url))
+    if not _is_safe_url(raw_url):
+        raise SkillUrlValidationError(raw_url, "URL failed validation")
+    auth_scheme, credential, header_name = _decrypt_skill_auth(merged)
+    try:
+        manifest = await _discover_skill_resources(raw_url, auth_scheme, credential, header_name)
+    except Exception as e:
+        logger.warning("Resource discovery error for %s: %s", redact_url(raw_url), type(e).__name__)
+        manifest = None
+    integrity = await _compute_content_integrity(
+        raw_url, manifest, auth_scheme, credential, header_name
+    )
+    if integrity is None:
+        raise SkillUrlValidationError(raw_url, "Could not compute replacement content integrity")
+    skill_md_hash = next((fh.sha256 for fh in integrity.file_hashes if fh.path == "SKILL.md"), None)
+    if not skill_md_hash:
+        raise SkillUrlValidationError(raw_url, "Could not compute replacement content integrity")
+
+    updates.update(
+        skill_md_raw_url=raw_url,
+        skill_md_content=None,
+        resource_manifest=manifest.model_dump(mode="json") if manifest else None,
+        content_integrity=integrity.model_dump(mode="json"),
+        content_version=skill_md_hash[:16],
+        content_updated_at=integrity.computed_at.isoformat(),
     )
 
 
@@ -1679,10 +1733,23 @@ class SkillService:
         self,
         path: str,
         updates: dict[str, Any],
+        *,
+        existing: SkillCard | None = None,
     ) -> SkillCard | None:
         """Update a skill."""
         normalized = normalize_skill_path(path)
         repo = self._get_repo()
+
+        if "skill_md_url" in updates:
+            existing = existing or await repo.get(normalized)
+            if existing is None:
+                return None
+            _, raw_url = translate_skill_url(str(updates["skill_md_url"]))
+            old_raw_url = (
+                existing.skill_md_raw_url or translate_skill_url(str(existing.skill_md_url))[1]
+            )
+            if raw_url != str(old_raw_url):
+                await _refresh_skill_content(existing, updates)
 
         # Gateway-proxy SSRF layer 2: if this update changes the proxy opt-in or
         # target, resolve+validate the MERGED target (existing values overlaid with

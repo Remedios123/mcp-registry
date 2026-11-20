@@ -39,6 +39,7 @@ from ..auth.tool_filter import filter_tools_for_user
 from ..common.log_redaction import redact_mapping, redact_url
 from ..constants import VALID_AUTH_SCHEMES, DeploymentType, HealthStatus
 from ..core.config import DeploymentMode, settings
+from ..core.mcp_apps import count_mcp_app_tools
 from ..core.metrics import ASSET_ID_SUPPLIED_TOTAL
 from ..core.schemas import (
     AuthCredentialUpdateRequest,
@@ -64,7 +65,11 @@ from ..services.lifecycle_events import (
     user_can_change_lifecycle_status,
 )
 from ..services.registration_gate_service import check_registration_gate
-from ..services.security_scanner import security_scanner_service
+from ..services.security_pending import tags_after_passing_scan
+from ..services.security_scanner import (
+    scan_credential_expected,
+    security_scanner_service,
+)
 from ..services.server_service import server_service
 from ..services.tool_blocks import annotate_blocked_tools, hide_blocked_tools
 from ..services.visibility import (
@@ -87,6 +92,7 @@ from ..utils.metadata_limits import (
     parse_metadata_json,
     validate_metadata_limits,
 )
+from ..utils.tool_list_hash import tool_list_hash
 from ._etag_utils import parse_if_match, updated_ms, weak_etag_for_timestamp
 
 logger = logging.getLogger(__name__)
@@ -462,6 +468,7 @@ async def _apply_tool_visibility(
     server_info["tool_list"] = filtered
     # Keep the badge/count consistent with what is actually rendered.
     server_info["num_tools"] = len(filtered)
+    server_info["num_mcp_app_tools"] = count_mcp_app_tools(filtered)
 
 
 async def _build_versions_list(
@@ -669,6 +676,68 @@ async def _apply_unsafe_scan_decision(
     return True
 
 
+async def _clear_server_security_pending(
+    path: str,
+    previous_scan: dict | None,
+) -> bool:
+    """Remove a scanner-set security-pending tag after a passing rescan (issue #2032).
+
+    Writes only the tags field, from a full copy of the stored server, the same
+    way tool discovery does, so nested secrets and the search index are intact.
+
+    Args:
+        path: The server path.
+        previous_scan: The latest stored scan result from before this rescan.
+
+    Returns:
+        True when the tag was removed.
+    """
+    server_info = await server_service.get_server_info(path)
+    if not server_info:
+        return False
+    new_tags = tags_after_passing_scan(server_info.get("tags"), previous_scan)
+    if new_tags is None:
+        return False
+    updated = server_info.copy()
+    updated["tags"] = new_tags
+    await server_service.update_server(path, updated, updated_fields=["tags"])
+    logger.info(f"Removed 'security-pending' from {path} after a passing rescan")
+    return True
+
+
+async def _add_server_security_pending(
+    path: str,
+) -> list[str] | None:
+    """Add the security-pending tag to a server after a failed scan.
+
+    Builds the write from a fresh read of the stored server, not from the
+    snapshot the scan was started with. update_server() decides whether to
+    re-pin the proxy target and clear upstream headers from the keys in the
+    dict it is given, so a stale snapshot would persist values derived from an
+    address that was changed while the scan ran. Only the tags field is written.
+
+    Args:
+        path: The server path.
+
+    Returns:
+        The stored tags after the write, or None when the server is gone or
+        already carries the tag.
+    """
+    server_info = await server_service.get_server_info(path)
+    if not server_info:
+        logger.warning(f"Server {path} not found when adding 'security-pending'")
+        return None
+    tags = list(server_info.get("tags") or [])
+    if "security-pending" in tags:
+        return None
+    tags.append("security-pending")
+    updated = server_info.copy()
+    updated["tags"] = tags
+    await server_service.update_server(path, updated, updated_fields=["tags"])
+    logger.info(f"Added 'security-pending' tag to {path}")
+    return tags
+
+
 async def _perform_security_scan_on_registration(
     path: str,
     proxy_pass_url: str,
@@ -716,6 +785,7 @@ async def _perform_security_scan_on_registration(
             headers=headers_json,
             timeout=scan_config.scan_timeout_seconds,
             mcp_endpoint=server_entry.get("mcp_endpoint"),
+            credential_expected=scan_credential_expected(server_entry),
         )
 
         # Handle unsafe servers
@@ -728,12 +798,13 @@ async def _perform_security_scan_on_registration(
 
             # Add security-pending tag if configured
             if scan_config.add_security_pending_tag:
-                current_tags = server_entry.get("tags", [])
-                if "security-pending" not in current_tags:
-                    current_tags.append("security-pending")
-                    server_entry["tags"] = current_tags
-                    await server_service.update_server(path, server_entry)
-                    logger.info(f"Added 'security-pending' tag to {path}")
+                # server_entry is a snapshot taken before the scan, so the write
+                # starts from the stored server instead (see the helper). The
+                # snapshot still gets the tag, because the webhook and the
+                # disable path below read it.
+                stored_tags = await _add_server_security_pending(path)
+                if stored_tags is not None:
+                    server_entry["tags"] = stored_tags
 
             # Disable server if configured. A scan that could not complete is not
             # an unsafe verdict: scan_server() reports is_safe=False with zero
@@ -1130,9 +1201,13 @@ async def get_servers_json(
                 # listed (marked), so it still counts; the UI greys it instead of
                 # implying the server lost a tool.
                 _num_tools = len(_filtered_tools)
+                # Same rule for the MCP App badge: count only the UI tools this
+                # user can see, so the badge matches the tools modal.
+                _num_mcp_app_tools = count_mcp_app_tools(_filtered_tools)
             else:
                 _filtered_tools = []
                 _num_tools = server_info.get("num_tools", 0)
+                _num_mcp_app_tools = server_info.get("num_mcp_app_tools", 0)
             service_data.append(
                 {
                     "id": server_info.get("id"),
@@ -1143,6 +1218,9 @@ async def get_servers_json(
                     "is_enabled": is_enabled,
                     "tags": server_info.get("tags", []),
                     "num_tools": _num_tools,
+                    # MCP Apps: tools that open an interactive page. Per-user when
+                    # the tool list was loaded, else the count the health check stored.
+                    "num_mcp_app_tools": _num_mcp_app_tools,
                     "license": server_info.get("license", "N/A"),
                     "health_status": normalized_status,
                     "last_checked_iso": health_data["last_checked_iso"],
@@ -1156,6 +1234,10 @@ async def get_servers_json(
                     "mcp_server_version_updated_at": server_info.get(
                         "mcp_server_version_updated_at"
                     ),
+                    # Tool drift detection (issue #2050): changes whenever any
+                    # tool's definition changes, so a client can skip a re-read.
+                    "tool_list_hash": server_info.get("tool_list_hash"),
+                    "tool_list_changed_at": server_info.get("tool_list_changed_at"),
                     "sync_metadata": server_info.get("sync_metadata"),
                     # ARD discovery imports (issue #1296): link to the source's
                     # original descriptor (server.json) so a client can resolve +
@@ -3484,17 +3566,22 @@ async def get_service_tools(
                 detail="Failed to fetch tools from MCP server. Service may be unhealthy.",
             )
 
-        # Update the server registry with the fresh tools
+        # Update the server registry with the fresh tools. Compare by hash, the
+        # same way the health loop does (issue #2050), so a change to any tool's
+        # name, description, schema or annotations is saved.
         new_tool_count = len(tool_list)
-        current_tool_count = server_info.get("num_tools", 0)
+        new_hash = tool_list_hash(tool_list)
 
-        if current_tool_count != new_tool_count or server_info.get("tool_list") != tool_list:
+        if tool_list_hash(server_info.get("tool_list")) != new_hash:
             logger.info(f"Updating tool list for {service_path}. New count: {new_tool_count}")
 
             # Update server info with fresh tools
             updated_server_info = server_info.copy()
             updated_server_info["tool_list"] = tool_list
             updated_server_info["num_tools"] = new_tool_count
+            updated_server_info["tool_list_hash"] = new_hash
+            if server_info.get("tool_list"):
+                updated_server_info["tool_list_changed_at"] = datetime.now(UTC).isoformat()
 
             # Save updated server info
             success = await server_service.update_server(service_path, updated_server_info)
@@ -5354,7 +5441,11 @@ async def put_server_oauth_discovery(
     An existing designation is preserved -- see below.
     """
     from ..egress_auth.service import vault_principal
-    from .egress_auth_routes import build_oauth_provider_config
+    from .egress_auth_routes import (
+        build_discovery_dcr_config,
+        build_oauth_provider_config,
+        provider_requires_dcr,
+    )
 
     set_audit_action(
         request,
@@ -5434,19 +5525,29 @@ async def put_server_oauth_discovery(
     # -- self-contained under Backend Auth, no egress_oauth dependency. Blank
     # client_secret keeps the stored ciphertext (edit).
     prior = (existing_server.get("oauth_discovery") or {}).get("oauth") or {}
-    oauth_cfg = build_oauth_provider_config(
-        provider=body.provider,
-        client_id=body.client_id,
-        client_secret=body.client_secret,
-        scopes=body.scopes,
-        custom_authorize_url=body.custom_authorize_url,
-        custom_token_url=body.custom_token_url,
-        custom_scope_separator=body.custom_scope_separator,
-        custom_token_auth_style=body.custom_token_auth_style,
-        custom_resource=body.custom_resource,
-        expected_issuer=body.expected_issuer,
-        prior_secret_encrypted=prior.get("client_secret_encrypted"),
-    )
+    if provider_requires_dcr(body.provider):
+        # No client can be typed in for a DCR provider: reuse the one the server's
+        # per-user egress save registered (same callback URL), or refuse with 400.
+        oauth_cfg = build_discovery_dcr_config(
+            server=existing_server,
+            provider=body.provider,
+            scopes=body.scopes,
+            expected_issuer=body.expected_issuer,
+        )
+    else:
+        oauth_cfg = build_oauth_provider_config(
+            provider=body.provider,
+            client_id=body.client_id,
+            client_secret=body.client_secret,
+            scopes=body.scopes,
+            custom_authorize_url=body.custom_authorize_url,
+            custom_token_url=body.custom_token_url,
+            custom_scope_separator=body.custom_scope_separator,
+            custom_token_auth_style=body.custom_token_auth_style,
+            custom_resource=body.custom_resource,
+            expected_issuer=body.expected_issuer,
+            prior_secret_encrypted=prior.get("client_secret_encrypted"),
+        )
     oauth_cfg["updated_at"] = datetime.now(UTC).isoformat()
 
     # Preserve an EXISTING designation. This endpoint both configures the provider
@@ -6801,6 +6902,9 @@ async def rescan_server(
 
     from ..exceptions import UrlValidationError
 
+    # Read before scanning: the new result replaces it as the latest.
+    previous_scan = await security_scanner_service.get_scan_result(path)
+
     try:
         # Trigger security scan
         scan_result = await security_scanner_service.scan_server(
@@ -6811,6 +6915,7 @@ async def rescan_server(
             headers=headers_json,
             timeout=None,
             mcp_endpoint=server_info.get("mcp_endpoint"),
+            credential_expected=scan_credential_expected(server_info),
         )
 
         # Apply the per-tool block on rescan too, not just at registration.
@@ -6856,6 +6961,9 @@ async def rescan_server(
                     f"Server {path} passed rescan; reconciled tool blocks, "
                     f"{len(cleared)} override(s) remain"
                 )
+
+        if scan_result.is_safe:
+            await _clear_server_security_pending(path, previous_scan)
 
         # Return the scan result data
         return {

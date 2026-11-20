@@ -3,6 +3,7 @@ import re
 from datetime import datetime
 from typing import (
     Annotated,
+    Any,
     Literal,
     get_args,
 )
@@ -57,6 +58,21 @@ class MatchingToolResult(BaseModel):
     match_context: str | None = None
     inputSchema: dict | None = Field(
         default=None, description="JSON Schema for tool input parameters"
+    )
+    ui_resource_uri: str | None = Field(
+        default=None,
+        description=(
+            "MCP Apps: the ui:// page this tool opens in clients that support MCP Apps. "
+            "Read it with resources/read on the same server. None when the tool has no page."
+        ),
+    )
+    annotations: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "MCP tool annotations the server declared: readOnlyHint, destructiveHint, "
+            "idempotentHint, openWorldHint and title. Advisory: the server sets them and "
+            "the registry does not verify them. None when the server declared none."
+        ),
     )
 
 
@@ -280,6 +296,21 @@ class ToolSearchResult(BaseModel):
     # Endpoint URL for the parent MCP server
     endpoint_url: str | None = Field(
         default=None, description="URL for agents to connect to the parent MCP server"
+    )
+    ui_resource_uri: str | None = Field(
+        default=None,
+        description=(
+            "MCP Apps: the ui:// page this tool opens in clients that support MCP Apps. "
+            "Read it with resources/read on server_path. None when the tool has no page."
+        ),
+    )
+    annotations: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "MCP tool annotations the server declared: readOnlyHint, destructiveHint, "
+            "idempotentHint, openWorldHint and title. Advisory: the server sets them and "
+            "the registry does not verify them. None when the server declared none."
+        ),
     )
 
 
@@ -905,6 +936,8 @@ async def semantic_search(
                 description=tool.get("description"),
                 relevance_score=tool["relevance_score"],
                 match_context=tool.get("match_context"),
+                ui_resource_uri=tool.get("ui_resource_uri"),
+                annotations=tool.get("annotations"),
                 inputSchema=schemas.get(tool.get("tool_name") or tool.get("name", "")),
             )
             for tool in allowed_matching
@@ -1017,6 +1050,8 @@ async def semantic_search(
                 similarity_score=tool.get("similarity_score"),
                 match_context=tool.get("match_context"),
                 endpoint_url=tool_endpoint_url,
+                ui_resource_uri=tool.get("ui_resource_uri"),
+                annotations=tool.get("annotations"),
             )
         )
 

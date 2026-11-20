@@ -22,6 +22,7 @@ from typing import (
 
 import httpx2
 from mcp import Client
+from mcp.client.extension import ClientExtension
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import (
@@ -31,8 +32,14 @@ from mcp.types import (
 from pydantic import ValidationError
 
 from ..common.log_redaction import redact_url
+from ..utils.tool_annotations import tool_metadata_fields
 from .backend_oauth import RESOLVED_BEARER_KEY as _BACKEND_OAUTH_TOKEN_KEY
 from .backend_oauth import with_bearer as _with_backend_oauth
+from .mcp_apps import (
+    MCP_APPS_EXTENSION_ID,
+    MCP_APPS_MIME_TYPE,
+    tool_ui_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +64,26 @@ MCP_DISCOVERY_CLIENT_VERSION: str = "2.0.0"
 # falls back to initialize. The HTTP+SSE transport predates 2026-07-28, so it
 # always uses the handshake.
 _TransportMode = Literal["auto", "legacy"]
+
+
+class _McpAppsUiExtension(ClientExtension):
+    """Declares MCP Apps support when the registry connects to a server.
+
+    A server that follows the MCP Apps spec lists its UI tools only to a client
+    that declares this extension. Kept here, not in mcp_apps.py, because it
+    needs the MCP SDK and mcp_apps.py must stay importable without it.
+    """
+
+    identifier = MCP_APPS_EXTENSION_ID
+
+    def settings(self) -> dict[str, Any]:
+        """Advertise the one page format the spec defines."""
+        return {"mimeTypes": [MCP_APPS_MIME_TYPE]}
+
+
+def _mcp_apps_client_extensions() -> list[ClientExtension]:
+    """Return the client extensions the registry declares during discovery."""
+    return [_McpAppsUiExtension()]
 
 
 def _assert_mcp_url_fetchable(
@@ -184,7 +211,9 @@ async def _discover_tools(
     In "auto" mode the SDK sends server/discover first. A 2026-07-28 server
     answers it and gets stateless requests. A handshake-era server does not,
     so the SDK falls back to initialize. Response caching is off, because
-    discovery must see the server's current list.
+    discovery must see the server's current list. The client declares MCP Apps
+    support, because a server that follows that spec hides its UI tools from a
+    client that does not.
 
     Args:
         transport: An SDK transport context manager, not yet entered.
@@ -206,6 +235,7 @@ async def _discover_tools(
             name=MCP_DISCOVERY_CLIENT_NAME,
             version=MCP_DISCOVERY_CLIENT_VERSION,
         ),
+        extensions=_mcp_apps_client_extensions(),
     )
     async with asyncio.timeout(MCP_DISCOVERY_TIMEOUT_SECONDS):
         async with client:
@@ -832,7 +862,9 @@ def _extract_tool_details(
         tools: Tools returned by tools/list, across all pages.
 
     Returns:
-        One dict per tool with name, description, parsed_description, schema.
+        One dict per tool with name, description, parsed_description, schema,
+        plus ui_resource_uri and ui_visibility for a tool with an MCP App page,
+        and title, annotations and outputSchema when the server sent them.
     """
     tool_details_list: list[dict[str, Any]] = []
 
@@ -896,17 +928,20 @@ def _extract_tool_details(
 
             tool_schema = tool.input_schema or {}
 
-            tool_details_list.append(
-                {
-                    "name": tool_name,
-                    "description": tool_desc or "",
-                    "parsed_description": parsed_desc,
-                    "schema": tool_schema,
-                    # The MCP field name, which the virtual-server mapping, the tool
-                    # catalog and search read. "schema" stays for ToolDescription.
-                    "inputSchema": tool_schema,
-                }
-            )
+            tool_detail = {
+                "name": tool_name,
+                "description": tool_desc or "",
+                "parsed_description": parsed_desc,
+                "schema": tool_schema,
+                # The MCP field name, which the virtual-server mapping, the tool
+                # catalog and search read. "schema" stays for ToolDescription.
+                "inputSchema": tool_schema,
+            }
+            # MCP Apps: ui_resource_uri and ui_visibility, only for a tool with a page.
+            tool_detail.update(tool_ui_fields(tool))
+            # title, annotations and outputSchema, only when the server sent them.
+            tool_detail.update(tool_metadata_fields(tool))
+            tool_details_list.append(tool_detail)
 
     logger.info(f"Successfully retrieved tool details count={len(tool_details_list):d}")
     return tool_details_list

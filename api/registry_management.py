@@ -1830,6 +1830,9 @@ def cmd_server_get(args: argparse.Namespace) -> int:
             "proxy_pass_url": server.proxy_pass_url,
             "tags": server.tags,
             "num_tools": server.num_tools,
+            "num_mcp_app_tools": server.num_mcp_app_tools,
+            "tool_list_hash": server.tool_list_hash,
+            "tool_list_changed_at": server.tool_list_changed_at,
             "tool_list": server.tool_list,
             "is_enabled": server.is_enabled,
             "health_status": server.health_status,
@@ -2273,6 +2276,7 @@ def cmd_egress_configure(args: argparse.Namespace) -> int:
             custom_resource=args.custom_resource,
             expected_issuer=args.expected_issuer,
             list_tools_before_consent=args.list_tools_before_consent,
+            re_register=args.re_register,
         )
         print(json.dumps(response, indent=2, default=str))
         return 0
@@ -2538,6 +2542,37 @@ def cmd_ard_ingestion_remove_source(args: argparse.Namespace) -> int:
         return 1
 
 
+def _format_tool_hints(
+    annotations: dict[str, Any] | None,
+) -> str:
+    """Describe the MCP annotation hints a server declared for a tool.
+
+    Only hints set to true are listed, plus "not read-only" for an explicit
+    readOnlyHint false. The server declares these and the registry does not
+    verify them.
+
+    Args:
+        annotations: The tool's annotations from a search result, or None.
+
+    Returns:
+        A comma-separated list such as "read-only, idempotent", or "".
+    """
+    if not annotations:
+        return ""
+    hints: list[str] = []
+    if annotations.get("readOnlyHint") is True:
+        hints.append("read-only")
+    elif annotations.get("readOnlyHint") is False:
+        hints.append("not read-only")
+    if annotations.get("destructiveHint") is True:
+        hints.append("destructive")
+    if annotations.get("idempotentHint") is True:
+        hints.append("idempotent")
+    if annotations.get("openWorldHint") is True:
+        hints.append("open-world")
+    return ", ".join(hints)
+
+
 def cmd_server_search(args: argparse.Namespace) -> int:
     """
     Perform semantic search across all entity types.
@@ -2602,6 +2637,9 @@ def cmd_server_search(args: argparse.Namespace) -> int:
                 print(f"    Relevance: {tool.relevance_score:.2%}")
                 if tool.similarity_score is not None:
                     print(f"    Similarity: {tool.similarity_score:.4f}")
+                hints = _format_tool_hints(tool.annotations)
+                if hints:
+                    print(f"    Hints (declared by the server): {hints}")
                 if tool.description:
                     desc = (
                         tool.description[:100] + "..."
@@ -7181,6 +7219,13 @@ Examples:
         help="oauth_user and pat only: list the server's stored tools on a direct-route "
         "tools/list before a user connects, for clients that only call tools an admin "
         "enabled ahead of time. Omitting it turns it off",
+    )
+    egress_configure_parser.add_argument(
+        "--re-register",
+        action="store_true",
+        help="oauth_user with a dynamic-client-registration provider only: register a new "
+        "OAuth client even when the stored one still fits (for example after the provider "
+        "revoked it). Cannot be combined with a --client-id that differs from the stored one",
     )
 
     # Get egress config command

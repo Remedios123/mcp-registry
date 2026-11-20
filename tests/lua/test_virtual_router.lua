@@ -180,6 +180,29 @@ do
 end
 
 -- ---------------------------------------------------------------------------
+print("test: _append_mapping_tools_for_backend keeps title, annotations and outputSchema")
+do
+    local mapping = { tools = {
+        { name = "delete_note", backend_location = "/b1", title = "Delete note",
+          annotations = { readOnlyHint = false, destructiveHint = true },
+          outputSchema = { type = "object" } },
+        { name = "ping", backend_location = "/b1" },
+    } }
+    local enriched = {}
+    M._append_mapping_tools_for_backend(enriched, mapping, "/b1")
+    local annotated, plain = enriched[1], enriched[2]
+    check(annotated and annotated.title == "Delete note", "fallback keeps the tool title")
+    check(annotated and annotated.annotations
+        and annotated.annotations.readOnlyHint == false
+        and annotated.annotations.destructiveHint == true,
+        "fallback keeps annotations, including an explicit false")
+    check(annotated and annotated.outputSchema and annotated.outputSchema.type == "object",
+        "fallback keeps outputSchema")
+    check(plain and plain.annotations == nil and plain.title == nil,
+        "a tool without the fields gets none")
+end
+
+-- ---------------------------------------------------------------------------
 print("test: _fetch_backend_list classifies every backend outcome the same way")
 do
     local function fetch(response, method, key)
@@ -1553,7 +1576,7 @@ do
         end
         lists = lists + 1
         if ngx.req._headers["Mcp-Session-Id"] ~= "now-stateful" then
-            return { status = 400, body = "" }
+            return { status = 400, body = "Bad Request: Missing session ID" }
         end
         return { status = 200, body = cjson.encode({ result = { tools = { { name = "t" } } } }) }
     end
@@ -2260,6 +2283,144 @@ do
             "unknown tool code is " .. case.code .. " when modern=" .. tostring(case.modern))
     end
     ngx.ctx.vr_modern_client = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: only a session-related 400 counts as a session rejection")
+do
+    check(M._is_session_rejection({ status = 404, body = "" }), "404 is a session rejection")
+    check(M._is_session_rejection({ status = 410, body = "" }), "410 is a session rejection")
+    check(M._is_session_rejection({ status = 400, body = "Bad Request: Missing session ID" }),
+        "a 400 naming the session ID is a session rejection")
+    check(M._is_session_rejection({ status = 400,
+        body = '{"jsonrpc":"2.0","error":{"code":-32000,"message":"Bad Request: Server not initialized"}}' }),
+        "a 400 saying the server is not initialized is a session rejection")
+    check(not M._is_session_rejection({ status = 400,
+        body = '{"jsonrpc":"2.0","error":{"code":-32020,"message":"Mcp-Protocol-Version header is required"}}' }),
+        "a -32020 header-mismatch 400 is not a session rejection")
+    check(not M._is_session_rejection({ status = 400, body = "" }), "an empty 400 is not a session rejection")
+    check(not M._is_session_rejection({ status = 500, body = "session" }), "a 500 is never a session rejection")
+end
+
+-- ---------------------------------------------------------------------------
+print("test: a non-session 400 from a legacy backend is returned without re-initializing")
+do
+    local inits, calls = 0, 0
+    capture_handler = function(loc, opts)
+        if loc == "/_vs_auth_strict400" then
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+            if opts.method == ngx.HTTP_GET then return { status = 404 } end
+            return { status = 200 }
+        end
+        if loc == "/_vs_backend_strict400" then
+            if cjson.decode(opts.body).method == "initialize" then
+                inits = inits + 1
+                return { status = 200, header = { ["Mcp-Session-Id"] = "sid" },
+                    body = '{"jsonrpc":"2.0","result":{"capabilities":{}}}' }
+            end
+            calls = calls + 1
+            return { status = 400, body = '{"jsonrpc":"2.0","id":1,"error":{"code":-32020,'
+                .. '"message":"Mcp-Protocol-Version header is required"}}' }
+        end
+    end
+    local body = cjson.encode({ jsonrpc = "2.0", id = 1, method = "tools/call", params = { name = "t" } })
+    local res, outcome = M._call_backend("/_vs_backend_strict400", body, "vs-strict", "srv", nil, false)
+    check(res and res.status == 400 and outcome == "ok", "the backend's 400 is returned to the caller")
+    check(inits == 1 and calls == 1, "no second initialize and no second call for a validation 400")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: a 2026-07-28 client's _meta version keys never reach a legacy backend")
+do
+    local sent = nil
+    local authorized_body = nil
+    capture_handler = function(loc, opts)
+        if loc == "/_vs_auth_legacy_meta" then
+            local x_body = ngx.req._headers["X-Body"]
+            if cjson.decode(x_body).method == "tools/call" then
+                authorized_body = x_body
+            end
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+            if opts.method == ngx.HTTP_GET then return { status = 404 } end
+            return { status = 200 }
+        end
+        if loc == "/_vs_backend_legacy_meta" then
+            local request = cjson.decode(opts.body)
+            if request.method == "initialize" then
+                return { status = 200, header = { ["Mcp-Session-Id"] = "sid" },
+                    body = '{"jsonrpc":"2.0","result":{"capabilities":{}}}' }
+            end
+            sent = { request = request, raw = opts.body, pv = ngx.req._headers["MCP-Protocol-Version"] }
+            return { status = 200, body = '{"jsonrpc":"2.0","id":1,"result":{"content":[]}}' }
+        end
+    end
+    ngx.ctx.vr_modern_client = true
+    M._proxy_to_backend(1, "tools/call", {
+        name = "get_me",
+        arguments = {},
+        _meta = {
+            ["io.modelcontextprotocol/protocolVersion"] = "2026-07-28",
+            ["io.modelcontextprotocol/clientInfo"] = { name = "cowork", version = "1" },
+            progressToken = "p-1",
+        },
+    }, "/_vs_backend_legacy_meta", "vs-legacy-meta", "srv")
+    local meta = sent and sent.request.params._meta
+    check(sent ~= nil and sent.request.params.name == "get_me", "the call reaches the legacy backend")
+    check(meta and meta["io.modelcontextprotocol/protocolVersion"] == nil
+        and meta["io.modelcontextprotocol/clientInfo"] == nil,
+        "the 2026-07-28 _meta keys are removed")
+    check(meta and meta.progressToken == "p-1", "other _meta keys such as progressToken are kept")
+    check(sent and sent.pv == nil, "no 2026-07-28 MCP-Protocol-Version header is sent")
+    check(sent and authorized_body == sent.raw, "/validate authorized the exact body the backend received")
+
+    local only_modern = { _meta = { ["io.modelcontextprotocol/protocolVersion"] = "2026-07-28" } }
+    M._strip_modern_meta(only_modern)
+    check(only_modern._meta == nil, "a _meta left empty is removed entirely")
+    ngx.ctx.vr_modern_client = nil
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: a call sends one era probe while the backend's era is uncached")
+do
+    -- Marked modern so the harness does not answer the probe's grant check;
+    -- the handler refuses it, so the era stays legacy and uncached.
+    modern_backends["/_vs_backend_probe_once"] = true
+    local probes, calls = 0, 0
+    capture_handler = function(loc, opts)
+        if loc == "/_vs_auth_probe_once" then
+            if cjson.decode(ngx.req._headers["X-Body"]).method == "server/discover" then
+                probes = probes + 1
+                return { status = 503 }
+            end
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+            if opts.method == ngx.HTTP_GET then return { status = 404 } end
+            return { status = 200 }
+        end
+        if loc == "/_vs_backend_probe_once" then
+            if cjson.decode(opts.body).method == "initialize" then
+                return { status = 200, header = { ["Mcp-Session-Id"] = "sid" },
+                    body = '{"jsonrpc":"2.0","result":{"capabilities":{}}}' }
+            end
+            calls = calls + 1
+            return { status = 200, body = '{"jsonrpc":"2.0","id":1,"result":{"content":[]}}' }
+        end
+    end
+    ngx.ctx.vr_modern_client = true
+    M._proxy_to_backend(1, "tools/call", { name = "t", _meta = {
+        ["io.modelcontextprotocol/protocolVersion"] = "2026-07-28" } },
+        "/_vs_backend_probe_once", "vs-probe-once", "srv")
+    check(calls == 1 and probes == 1, "one tools/call sends exactly one server/discover probe")
+    ngx.ctx.vr_modern_client = nil
+    modern_backends["/_vs_backend_probe_once"] = nil
+    capture_handler = nil
 end
 
 -- ---------------------------------------------------------------------------

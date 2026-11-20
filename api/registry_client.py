@@ -162,6 +162,16 @@ class ServerDetail(BaseModel):
     url: str = Field(..., description="Service URL")
     is_enabled: bool = Field(..., description="Whether service is enabled")
     num_tools: int = Field(..., description="Number of tools")
+    num_mcp_app_tools: int = Field(
+        default=0, description="Number of tools that open an MCP App page"
+    )
+    tool_list_hash: str | None = Field(
+        None,
+        description="SHA-256 over the server's tool definitions; changes when any tool changes",
+    )
+    tool_list_changed_at: str | None = Field(
+        None, description="When tool discovery last saved a changed tool list (ISO 8601 UTC)"
+    )
     health_status: str = Field(..., description="Health status")
     last_health_check: datetime | None = Field(None, description="Last health check timestamp")
     status: str = Field(
@@ -186,6 +196,16 @@ class ServerDetailResponse(BaseModel):
     proxy_pass_url: str | None = Field(None, description="Backend URL")
     tags: list[str] = Field(default_factory=list, description="Server tags")
     num_tools: int = Field(default=0, description="Number of tools")
+    num_mcp_app_tools: int = Field(
+        default=0, description="Number of tools that open an MCP App page"
+    )
+    tool_list_hash: str | None = Field(
+        None,
+        description="SHA-256 over the server's tool definitions; changes when any tool changes",
+    )
+    tool_list_changed_at: str | None = Field(
+        None, description="When tool discovery last saved a changed tool list (ISO 8601 UTC)"
+    )
     tool_list: list[dict[str, Any]] = Field(default_factory=list, description="Tool definitions")
     is_enabled: bool = Field(default=False, description="Whether server is enabled")
     health_status: str | None = Field(None, description="Health status")
@@ -197,7 +217,7 @@ class ServerDetailResponse(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    @field_validator("num_tools", mode="before")
+    @field_validator("num_tools", "num_mcp_app_tools", mode="before")
     @classmethod
     def _default_num_tools(cls, value: Any) -> Any:
         """Coerce a null num_tools to 0.
@@ -980,6 +1000,13 @@ class MatchingToolResult(BaseModel):
     inputSchema: dict[str, Any] | None = Field(
         None, description="JSON Schema for tool input parameters"
     )
+    annotations: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "MCP tool annotations the server declared (readOnlyHint, destructiveHint, "
+            "idempotentHint, openWorldHint, title). Advisory, not verified by the registry"
+        ),
+    )
 
 
 class SyncMetadata(BaseModel):
@@ -1056,6 +1083,13 @@ class ToolSearchResult(BaseModel):
         ),
     )
     match_context: str | None = Field(None, description="Why this tool matched")
+    annotations: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "MCP tool annotations the server declared (readOnlyHint, destructiveHint, "
+            "idempotentHint, openWorldHint, title). Advisory, not verified by the registry"
+        ),
+    )
     # Endpoint URL for the parent MCP server
     endpoint_url: str | None = Field(
         None, description="URL for agents to connect to the parent MCP server"
@@ -4067,6 +4101,7 @@ class RegistryClient:
         custom_resource: str | None = None,
         expected_issuer: str | None = None,
         list_tools_before_consent: bool = False,
+        re_register: bool = False,
     ) -> dict[str, Any]:
         """Configure per-user egress auth on a server (admin only).
 
@@ -4102,6 +4137,10 @@ class RegistryClient:
                 server's stored tools on a direct-route tools/list before the
                 user connects (issue #1986). The request replaces the whole
                 config, so leaving this False turns it off.
+            re_register: oauth_user with a dynamic-client-registration provider
+                only. Register a new OAuth client even when the stored one still
+                fits, for example after the provider revoked it. Cannot be
+                combined with a ``client_id`` that differs from the stored one.
 
         Returns:
             Non-secret egress config view dict.
@@ -4140,6 +4179,8 @@ class RegistryClient:
         if expected_issuer is not None:
             body["expected_issuer"] = expected_issuer
         body["list_tools_before_consent"] = list_tools_before_consent
+        if re_register:
+            body["re_register"] = True
 
         response = self._make_request(
             method="POST",

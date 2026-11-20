@@ -558,6 +558,47 @@ class TestGenerateVirtualBackendLocations:
         assert data["tools"][0]["inputSchema"] == schema
 
     @pytest.mark.asyncio
+    async def test_mapping_carries_backend_tool_annotations(self, mock_server_repository):
+        """The Lua fallback tools/list reads the mapping file, so the mapping must
+        carry the backend tool's title, annotations and outputSchema. Invalid
+        stored hints are dropped, and a tool without them gets no extra keys."""
+        vs = _make_vs_config(
+            tool_mappings=[
+                ToolMapping(tool_name="delete_note", backend_server_path="/notes"),
+                ToolMapping(tool_name="ping", backend_server_path="/notes"),
+            ]
+        )
+        mock_server_repository.get.side_effect = {
+            "/notes": {
+                "is_enabled": True,
+                "proxy_pass_url": "http://svc:8000/mcp",
+                "tool_list": [
+                    {
+                        "name": "delete_note",
+                        "description": "Delete",
+                        "title": "Delete note",
+                        "annotations": {"destructiveHint": True, "readOnlyHint": "no"},
+                        "outputSchema": {"type": "object"},
+                    },
+                    {"name": "ping", "description": "Ping"},
+                ],
+            },
+        }.get
+        from registry.core.nginx_service import NginxConfigService
+
+        with TemporaryDirectory() as tmpdir:
+            with patch("registry.core.nginx_service.VIRTUAL_MAPPINGS_DIR", Path(tmpdir)):
+                await NginxConfigService()._write_virtual_server_mappings([vs])
+            data = json.loads((Path(tmpdir) / "dev-essentials.json").read_text())
+
+        by_name = {tool["name"]: tool for tool in data["tools"]}
+        assert by_name["delete_note"]["annotations"] == {"destructiveHint": True}
+        assert by_name["delete_note"]["title"] == "Delete note"
+        assert by_name["delete_note"]["outputSchema"] == {"type": "object"}
+        for key in ("annotations", "title", "outputSchema"):
+            assert key not in by_name["ping"]
+
+    @pytest.mark.asyncio
     async def test_versioned_path_without_explicit_pin_uses_selected_doc(
         self, mock_server_repository
     ):
@@ -880,6 +921,103 @@ class TestGenerateVirtualBackendLocations:
 
         assert "location = /_vs_auth_airegistry-tools" in result
         assert "location = /_vs_backend_airegistry-tools" in result
+
+    @pytest.mark.asyncio
+    async def test_builtin_backend_routes_through_mcp_proxy(self, mock_server_repository):
+        """Issue #2060: the built-in keeps the caller's bearer via the MCP proxy relay."""
+        from registry.core.nginx_service import NginxConfigService
+
+        mock_server_repository.get.return_value = {
+            "is_enabled": True,
+            "proxy_pass_url": "http://mcpgw-server:8003/",
+            "egress_auth_mode": "none",
+        }
+        vs = _make_vs_config(
+            tool_mappings=[
+                ToolMapping(tool_name="search_registry", backend_server_path="/airegistry-tools")
+            ]
+        )
+        result = await NginxConfigService()._generate_virtual_backend_locations([vs])
+        block = _location_block(result, "/_vs_backend_airegistry-tools")
+
+        assert "/mcp-proxy/airegistry-tools/;" in block
+        assert "proxy_set_header X-Internal-Token $http_x_internal_token;" in block
+        assert 'proxy_set_header X-Registered-Route-Mode "virtual";' in block
+        assert "proxy_pass http://mcpgw-server:8003" not in block
+        assert 'proxy_set_header Authorization "";' not in block
+        assert 'proxy_set_header X-Authorization "";' not in block
+
+    @pytest.mark.asyncio
+    async def test_repointed_builtin_path_stays_direct(self, mock_server_repository):
+        """/airegistry-tools pointed at another target never gets the ingress relay hop."""
+        from registry.core.nginx_service import NginxConfigService
+
+        mock_server_repository.get.return_value = {
+            "is_enabled": True,
+            "proxy_pass_url": "https://elsewhere.example.com/mcp",
+            "egress_auth_mode": "none",
+        }
+        vs = _make_vs_config(
+            tool_mappings=[ToolMapping(tool_name="search", backend_server_path="/airegistry-tools")]
+        )
+        result = await NginxConfigService()._generate_virtual_backend_locations([vs])
+        block = _location_block(result, "/_vs_backend_airegistry-tools")
+
+        assert "proxy_pass https://elsewhere.example.com/mcp;" in block
+        assert "/mcp-proxy/" not in block
+        for name in ("Authorization", "X-Authorization", "Cookie", "X-Internal-Token"):
+            assert f'proxy_set_header {name} "";' in block
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("backend_path", "proxy_pass_url"),
+        [
+            ("/airegistry-tools-copy", "http://mcpgw-server:8003/"),
+            ("/airegistry-tools", "http://mcpgw-server:9000/"),
+        ],
+    )
+    async def test_lookalike_builtin_target_is_not_rendered(
+        self,
+        mock_server_repository,
+        backend_path,
+        proxy_pass_url,
+    ):
+        """The reserved mcpgw host outside the exact built-in identity gets no location."""
+        from registry.core.nginx_service import NginxConfigService
+
+        mock_server_repository.get.return_value = {
+            "is_enabled": True,
+            "proxy_pass_url": proxy_pass_url,
+            "egress_auth_mode": "none",
+        }
+        vs = _make_vs_config(
+            tool_mappings=[ToolMapping(tool_name="search", backend_server_path=backend_path)]
+        )
+        result = await NginxConfigService()._generate_virtual_backend_locations([vs])
+
+        assert "location = /_vs_backend" not in result
+        assert "/mcp-proxy/" not in result
+
+    @pytest.mark.asyncio
+    async def test_builtin_backend_mapping_keeps_egress_mode_none(
+        self,
+        mock_server_repository,
+        tmp_path,
+    ):
+        """The Lua mapping still treats the built-in as a non-egress backend."""
+        mock_server_repository.get.return_value = {
+            "is_enabled": True,
+            "proxy_pass_url": "http://mcpgw-server:8003/",
+            "egress_auth_mode": "none",
+        }
+        vs = _make_vs_config(
+            tool_mappings=[
+                ToolMapping(tool_name="search_registry", backend_server_path="/airegistry-tools")
+            ]
+        )
+        mapping = await _write_mappings_and_read(vs, str(tmp_path))
+
+        assert mapping["tools"][0]["egress_auth_mode"] == "none"
 
     @pytest.mark.asyncio
     async def test_backend_auth_uses_bounded_validation_timeouts(self, mock_server_repository):
@@ -1304,6 +1442,38 @@ class TestWriteVirtualServerMappings:
         assert mapped == {"/_vs_backend_live"}
         for location in mapped:
             assert f"location = {location} {{" in locations
+
+    @pytest.mark.asyncio
+    async def test_omitted_tool_warns_once_until_reset(self, mock_server_repository, caplog):
+        """The scheduler re-renders every few seconds; an omitted tool must log one
+        WARNING, then DEBUG on repeats, and WARNING again after mark_dirty resets."""
+        import logging
+
+        from registry.core.nginx_service import NginxConfigService
+
+        mock_server_repository.get.side_effect = lambda path: None
+        vs = _make_vs_config(
+            tool_mappings=[ToolMapping(tool_name="gone", backend_server_path="/deleted")]
+        )
+        service = NginxConfigService()
+
+        def _omit_warnings() -> int:
+            return sum(
+                1
+                for record in caplog.records
+                if record.levelno == logging.WARNING and "Omitting tool" in record.message
+            )
+
+        caplog.set_level(logging.DEBUG, logger="registry.core.nginx_service")
+        with TemporaryDirectory() as tmpdir:
+            with patch("registry.core.nginx_service.VIRTUAL_MAPPINGS_DIR", Path(tmpdir)):
+                await service._write_virtual_server_mappings([vs])
+                await service._write_virtual_server_mappings([vs])
+                assert _omit_warnings() == 1
+
+                service.reset_virtual_warnings()
+                await service._write_virtual_server_mappings([vs])
+                assert _omit_warnings() == 2
 
 
 class TestEncodePathForLocation:

@@ -8,7 +8,7 @@ global:
   image:
     # Container registry (host + optional namespace), e.g. "public.ecr.aws/p3v1o3c6"
     registry: public.ecr.aws/p3v1o3c6
-    tag: 1.37.0
+    tag: 1.38.0
     pullPolicy: IfNotPresent
   # When installing chart from repository, add --set global.chartVersion=$(git rev-parse HEAD) to add the git hash to a configmap for debugging
   chartVersion:
@@ -552,6 +552,11 @@ registry:
     # Tool-level access control (issue #1026)
     mcpToolsListFilterEnabled: true # Registry-side awareness of the MCP tools/list filter (also read by auth-server)
     toolFilterAuditLogLevel: "INFO" # Audit log level for tool-prune events (DEBUG, INFO, WARNING)
+    # Health checks and tool list refresh (issue #2050)
+    healthCheckIntervalSeconds: 300 # Seconds between health checks of every server; also one tool refresh cycle
+    toolRefreshEnabled: false # Fetch tools again from servers that stay healthy, on a schedule. Each replica refreshes on its own
+    toolRefreshEveryCycles: 3 # Fetch each healthy server once every N health cycles (1-1000); 3 x 300 s = 15 min
+    toolFetchMaxConcurrency: 5 # Most background tool fetches one replica runs at once (1-100)
     # Gateway generic-proxy feature (registry-consumed). Ships DISABLED. See the
     # auth-server section for the eleven auth-server-consumed knobs + the egress
     # NetworkPolicy that MUST be deployed before enabling.

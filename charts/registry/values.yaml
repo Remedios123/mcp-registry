@@ -11,7 +11,7 @@ global:
   image:
     # Container registry (host + optional namespace). Shared default across subcharts.
     registry: public.ecr.aws/p3v1o3c6
-    tag: 1.37.0
+    tag: 1.38.0
     pullPolicy: IfNotPresent
   cloud:
     # AWS region for cloud detection in telemetry. Set this when deploying
@@ -341,6 +341,11 @@ app:
   # Tool-level access control (issue #1026)
   mcpToolsListFilterEnabled: true # Registry-side awareness of the MCP tools/list filter (also read by auth-server)
   toolFilterAuditLogLevel: "INFO" # Audit log level for tool-prune events (DEBUG, INFO, WARNING)
+  # Health checks and tool list refresh (issue #2050)
+  healthCheckIntervalSeconds: 300 # Seconds between health checks of every server; also one tool refresh cycle
+  toolRefreshEnabled: false # Fetch tools again from servers that stay healthy, on a schedule. Each replica refreshes on its own
+  toolRefreshEveryCycles: 3 # Fetch each healthy server once every N health cycles (1-1000); 3 x 300 s = 15 min
+  toolFetchMaxConcurrency: 5 # Most background tool fetches one replica runs at once (1-100)
   # Custom entity types (admin-defined, schema-driven catalog types)
   customEntityTypesEnabled: false # Main switch for dynamic tabs + endpoints; off = no behavior change
   customTypeCacheTtlSeconds: 60 # TTL (s) for the in-process custom-type descriptor cache
@@ -600,7 +605,7 @@ cognito:
   userPoolId: "" # Cognito User Pool ID
   clientId: ""
   clientSecret: ""
-  domain: "" # Optional: custom Cognito domain
+  domain: "" # Optional: hosted-UI domain PREFIX, not a hostname. Empty derives it from the user pool id
   region: "us-east-1" # AWS region for the User Pool
 # Per-user egress credential vault (third-party OBO support).
 # When enabled, the registry renders a discrete `registry-egress-config`

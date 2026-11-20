@@ -41,19 +41,19 @@ variable "task_execution_role_arn" {
 variable "registry_image_uri" {
   description = "Container image URI for registry service (defaults to pre-built image from public ECR)"
   type        = string
-  default     = "public.ecr.aws/p3v1o3c6/registry:1.37.0"
+  default     = "public.ecr.aws/p3v1o3c6/registry:1.38.0"
 }
 
 variable "auth_server_image_uri" {
   description = "Container image URI for auth server service (defaults to pre-built image from public ECR)"
   type        = string
-  default     = "public.ecr.aws/p3v1o3c6/auth-server:1.37.0"
+  default     = "public.ecr.aws/p3v1o3c6/auth-server:1.38.0"
 }
 
 variable "mcpgw_image_uri" {
   description = "Container image URI for mcpgw service (defaults to pre-built image from public ECR)"
   type        = string
-  default     = "public.ecr.aws/p3v1o3c6/mcpgw:1.37.0"
+  default     = "public.ecr.aws/p3v1o3c6/mcpgw:1.38.0"
 }
 
 variable "enable_demo_servers" {
@@ -717,7 +717,7 @@ variable "documentdb_credentials_secret_arn" {
 # discrete variables. Prefer mongodb_connection_string_secret_arn when the
 # URI contains credentials to avoid storing secrets in Terraform state.
 variable "mongodb_connection_string" {
-  description = "Optional full MongoDB connection string override (plain text). Takes precedence over documentdb_* variables. Leave empty to use documentdb_* variables."
+  description = "Optional full MongoDB connection string override (plain text). Takes precedence over documentdb_* variables. Leave empty to use documentdb_* variables. The module stores it in Secrets Manager and injects it through the task secrets block, so it does not appear in the task definition; it does still appear in Terraform state."
   type        = string
   default     = ""
   sensitive   = true
@@ -922,7 +922,7 @@ variable "cognito_client_secret" {
 }
 
 variable "cognito_domain" {
-  description = "Optional Cognito hosted UI domain prefix or custom domain. Leave empty to derive it from the User Pool ID."
+  description = "Optional Cognito hosted-UI domain PREFIX (for example \"mcp-gw\"), not a hostname: the auth server appends \".auth.<region>.amazoncognito.com\", so a custom domain is not supported. Leave empty to derive it from the User Pool ID (us-east-1_KmP5A3La3 becomes us-east-1kmp5a3la3). That works only if the pool's domain uses that prefix, so set it explicitly otherwise."
   type        = string
   default     = ""
 }
@@ -1587,6 +1587,45 @@ variable "mcp_tools_list_filter_enabled" {
   description = "Enable filtering of MCP tools/list JSON-RPC responses against the per-user tool allowlist. Set to false to revert to pre-fix behavior on the MCP protocol path only. REST endpoints always filter regardless of this flag."
   type        = bool
   default     = true
+}
+
+variable "health_check_interval_seconds" {
+  description = "How often the registry health-checks every enabled server, in seconds. Also the length of one tool refresh cycle. Default 300."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.health_check_interval_seconds >= 1
+    error_message = "health_check_interval_seconds must be at least 1."
+  }
+}
+
+variable "tool_refresh_enabled" {
+  description = "Fetch tools again from servers that stay healthy, on a schedule, so the stored tool list picks up description and input schema changes. Each registry task refreshes on its own, so upstream servers see one refresh per task per period. Default false."
+  type        = bool
+  default     = false
+}
+
+variable "tool_refresh_every_cycles" {
+  description = "Fetch each healthy server once every this many health cycles (1 to 1000). The period is at least this value times health_check_interval_seconds, because a cycle also includes the time the checks take. Default 3."
+  type        = number
+  default     = 3
+
+  validation {
+    condition     = var.tool_refresh_every_cycles >= 1 && var.tool_refresh_every_cycles <= 1000
+    error_message = "tool_refresh_every_cycles must be between 1 and 1000."
+  }
+}
+
+variable "tool_fetch_max_concurrency" {
+  description = "Most background tool fetches one registry task runs at once (1 to 100). Default 5."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.tool_fetch_max_concurrency >= 1 && var.tool_fetch_max_concurrency <= 100
+    error_message = "tool_fetch_max_concurrency must be between 1 and 100."
+  }
 }
 
 variable "mcp_proxy_max_body_bytes" {

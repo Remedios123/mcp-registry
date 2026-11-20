@@ -367,7 +367,7 @@ that server's Connect dialog:
 | Client ID | `COGNITO_CLIENT_ID` | — | `auth-server.cognito.clientId` | — |
 | Client secret **(secret)** | `COGNITO_CLIENT_SECRET` | — | `auth-server.cognito.clientSecret` | — |
 | Enabled | `COGNITO_ENABLED` | — | — | — |
-| Custom domain | `COGNITO_DOMAIN` | — | `auth-server.cognito.domain` | Optional. |
+| Hosted-UI domain prefix | `COGNITO_DOMAIN` | `cognito_domain` | `auth-server.cognito.domain` | Optional. A prefix such as `mcp-gw`, not a hostname: the auth server appends `.auth.<region>.amazoncognito.com`, so a custom domain is not supported. Empty, unset or `auto` derives it from the user pool id (`us-east-1_KmP5A3La3` becomes `us-east-1kmp5a3la3`). That works only if the pool's domain uses that prefix, so set it explicitly otherwise. |
 | M2M client allowlist | `COGNITO_M2M_CLIENT_IDS` | `cognito_m2m_client_ids` | `auth-server.cognito.m2mClientIds` | Comma/space-separated allowlist of Cognito app-client ids whose machine (`client_credentials`) access tokens the gateway accepts (Cognito access tokens are not audience-bound, so the `client_id` claim is checked against this list). Default-empty = fail closed. Use `*` to accept ANY M2M client in the pool without listing each (machine/no-`username` tokens only; user logins stay restricted to the web + IDE clients) — for one M2M client per agent. Only use `*` when the pool is dedicated to the gateway. Required for Cognito agent/M2M callers, e.g. per-agent rate limiting. |
 | Region | `AWS_REGION` | `aws_region` | `auth-server.cognito.region` | — |
 
@@ -459,6 +459,19 @@ Controls the per-user tool allowlist filter applied at the registry REST endpoin
 | Tool-filter audit log level | `TOOL_FILTER_AUDIT_LOG_LEVEL` | `tool_filter_audit_log_level` | `auth-server.app.toolFilterAuditLogLevel`, `registry.app.toolFilterAuditLogLevel` | Launch-window log level for prune audit lines: `DEBUG`, `INFO`, or `WARNING`. Default `INFO`; flip to `DEBUG` after two quiet weeks in production. |
 | Internal token TTL | `INTERNAL_TOKEN_TTL_SECONDS` | `internal_token_ttl_seconds` | `auth-server.app.internalTokenTtlSeconds`, `registry.app.internalTokenTtlSeconds` | Lifetime (seconds) of the `/validate`-minted internal hop tokens that harden the `/mcp-proxy` hop and the registry `/api/` hop; the replay-window cap. Minimum 5. Default `30`. (auth-server mints; the value is the same TTL on both surfaces.) |
 | Internal token leeway | `INTERNAL_TOKEN_LEEWAY_SECONDS` | `internal_token_leeway_seconds` | `auth-server.app.internalTokenLeewaySeconds`, `registry.app.internalTokenLeewaySeconds` | Clock-skew leeway (seconds) on the internal hop tokens' `exp`/`iat` checks. Default `5`. Verification is always enforced (fail-closed); there is no opt-out. Reuses `SECRET_KEY` — no new secret. |
+
+---
+
+## Group 13a1: Health Checks and Tool List Refresh (Issue #2050)
+
+How often the registry health-checks servers, and whether it fetches tools again from servers that stay healthy. The refresh period is at least `TOOL_REFRESH_EVERY_CYCLES` times `HEALTH_CHECK_INTERVAL_SECONDS`, because each cycle also includes the time the checks take. Each registry replica runs its own health loop, so with two replicas every upstream server sees two refreshes per period. All four values are non-sensitive. See [`docs/tool-list-refresh.md`](./tool-list-refresh.md).
+
+| Parameter | Docker (`.env`) | Terraform (`.tfvars`) | Helm (`values.yaml`) | Purpose |
+|-----------|-----------------|-----------------------|----------------------|---------|
+| Health check interval | `HEALTH_CHECK_INTERVAL_SECONDS` | `health_check_interval_seconds` | `registry.app.healthCheckIntervalSeconds` | Seconds between health checks of every enabled server, and the length of one tool refresh cycle. The code default is `300`, which Terraform, Helm and CDK use; the Docker Compose files default it to `30`. |
+| Tool refresh enabled | `TOOL_REFRESH_ENABLED` | `tool_refresh_enabled` | `registry.app.toolRefreshEnabled` | Fetch tools again from servers that stay healthy, on a schedule, so the stored tool list picks up description and input schema changes. Default `false`. Per replica: refresh load grows with the replica count. |
+| Tool refresh every N cycles | `TOOL_REFRESH_EVERY_CYCLES` | `tool_refresh_every_cycles` | `registry.app.toolRefreshEveryCycles` | Fetch each healthy server once every this many health cycles. Each server starts on a random cycle so fetches spread evenly. Range `1` to `1000`. Default `3` (15 minutes at a 300 s interval, 90 s at Compose's 30 s). |
+| Max concurrent tool fetches | `TOOL_FETCH_MAX_CONCURRENCY` | `tool_fetch_max_concurrency` | `registry.app.toolFetchMaxConcurrency` | Most background tool fetches one registry process runs at once, across first checks, recoveries, refreshes and the UI refresh. Range `1` to `100`. Default `5`; raise to `10` for about a thousand servers or a short health interval. |
 
 ---
 
