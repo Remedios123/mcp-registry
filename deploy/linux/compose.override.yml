@@ -14,7 +14,7 @@ x-broker: &broker
 services:
   registry:
     image: local/mcp-registry:${BUILD_VERSION:?required}
-    ports: !override ["443:8080"]
+    ports: !override ["443:8443"]
     depends_on:
       cas-shim:
         condition: service_healthy
@@ -34,9 +34,11 @@ services:
       - /data/mcp-gateway/logs:/var/log/containers/ai-registry
       - registry-logs:/app/logs
       - registry-scans:/app/security_scans
-      - ./deploy/linux/.generated/nginx_rev_proxy_http_only.conf:/app/docker/nginx_rev_proxy_http_only.conf:ro
       - ./deploy/linux/.generated/nginx_rev_proxy_http_and_https.conf:/app/docker/nginx_rev_proxy_http_and_https.conf:ro
       - ./deploy/linux/cas-browser.conf:/etc/nginx/cas-browser.inc:ro
+      - ./deploy/linux/cas-credentials.conf:/etc/nginx/cas-credentials.inc:ro
+      - /data/mcp-gateway/config/tls/fullchain.pem:/etc/ssl/certs/fullchain.pem:ro
+      - /data/mcp-gateway/config/tls/private:/etc/ssl/private:ro
   auth-server:
     image: local/mcp-auth-server:${BUILD_VERSION}
     environment: *browser

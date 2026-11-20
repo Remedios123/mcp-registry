@@ -41,5 +41,25 @@ PY
   'from urllib.request import urlopen; print("mcpgw",urlopen("http://mcpgw-server:8003/health",timeout=8).status)' || failed=1
 "${dc[@]}" ps -a
 origin=$("${dc[@]}" exec -T registry printenv REGISTRY_URL)
+# This request contains no employee identity or service token.
+"${dc[@]}" exec -T registry python - <<'PY' || failed=1
+from urllib.error import HTTPError
+from urllib.request import urlopen
+
+try:
+    urlopen("http://127.0.0.1:8093/internal/business-token/probe", timeout=8)
+except HTTPError as exc:
+    if exc.code != 403 or exc.read() != b'{"error":"forbidden"}':
+        raise
+    print("Internal credential route reached shim and rejected missing authentication.")
+else:
+    raise SystemExit("Internal credential route did not require authentication.")
+PY
+curl -fsS -o /dev/null --connect-timeout 5 --max-time 20 "$origin/" || failed=1
+outside=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 "$origin/internal/business-token/probe") || failed=1
+if [[ $outside != 404 ]]; then
+  printf 'Unexpected response on the public credential path: %s\n' "$outside" >&2
+  failed=1
+fi
 printf 'BROWSER PENDING: on the employee Windows PC open %s, verify login and %s/airegistry-tools/mcp through WorkBuddy. Record the result separately.\n' "$origin" "$origin"
 exit "$failed"

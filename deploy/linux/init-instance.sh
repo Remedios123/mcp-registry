@@ -9,6 +9,12 @@ mountpoint -q /data || { echo '/data is not mounted' >&2; exit 1; }
 envfile=${GATEWAY_ENV:-$base/config/gateway.env}
 [[ -s "$envfile" && -s "$base/models/bge-small-zh-v1.5/model.safetensors" ]] || {
   echo 'Install the private env and BGE model first.' >&2; exit 1; }
+tls=$base/config/tls
+[[ -s "$tls/fullchain.pem" && -s "$tls/private/privkey.pem" ]] || {
+  echo 'Install the TLS certificate and key before starting the gateway.' >&2; exit 1; }
+chown root:1000 "$tls/private" "$tls/private/privkey.pem"
+chmod 0750 "$tls/private"
+chmod 0640 "$tls/private/privkey.pem"
 chmod 600 "$envfile"
 install -d -m 0755 "$base/config/ca"
 install -d -m 0750 -o 1000 -g 1000 "$base/logs" "$base/data/servers" "$base/data/agents"
@@ -18,27 +24,27 @@ if [[ ! -e "$base/config/federation.json" ]]; then
 fi
 chmod 644 "$base/config/federation.json"
 
-# Generate from this release's upstream templates without modifying tracked files.
+# Add the company proxy rules to this release's upstream HTTPS template.
 mkdir -p deploy/linux/.generated
-for filename in nginx_rev_proxy_http_only.conf nginx_rev_proxy_http_and_https.conf; do
-  target="deploy/linux/.generated/$filename"
-  tmp=$(mktemp "${target}.XXXXXX")
-  if ! awk -v http_only="$([[ $filename == *http_only* ]] && echo 1 || echo 0)" '
-    { if (http_only && $0 ~ /^[[:space:]]*8080[[:space:]]+80;$/) {
-        sub(/80;$/, "443;"); port++
-      }
-      print
-      if ($0 ~ /server_name localhost [{][{]ADDITIONAL_SERVER_NAMES[}][}];/) {
-        print "    include /etc/nginx/cas-browser.inc;"; count++
-      }
-    }
-    END { if (count != (http_only ? 1 : 2) || (http_only && port != 1)) exit 1 }
-  ' "docker/$filename" > "$tmp"; then
-    rm -f -- "$tmp"; echo "Upstream template layout changed: $filename" >&2; exit 1
-  fi
-  chmod 644 "$tmp"
-  if cmp -s "$tmp" "$target"; then rm -f -- "$tmp"; else mv -- "$tmp" "$target"; fi
-done
+filename=nginx_rev_proxy_http_and_https.conf
+target=deploy/linux/.generated/$filename
+tmp=$(mktemp "$target.XXXXXX")
+if ! awk '
+  { print }
+  /server_name localhost [{][{]ADDITIONAL_SERVER_NAMES[}][}];/ {
+    print "    include /etc/nginx/cas-browser.inc;"; count++
+  }
+  END {
+    if (count != 2) exit 1
+    print "include /etc/nginx/cas-credentials.inc;"
+  }
+' "docker/$filename" > "$tmp"; then
+  rm -f -- "$tmp"
+  echo "Upstream template layout changed: $filename" >&2
+  exit 1
+fi
+chmod 644 "$tmp"
+if cmp -s "$tmp" "$target"; then rm -f -- "$tmp"; else mv -- "$tmp" "$target"; fi
 
 "${dc[@]}" config --quiet
 "${dc[@]}" build registry auth-server mcpgw-server metrics-service metrics-db cas-shim

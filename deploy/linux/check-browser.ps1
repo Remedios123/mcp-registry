@@ -1,4 +1,4 @@
-param([uri]$Gateway = 'http://10.100.3.74:443')
+param([uri]$Gateway = 'https://mcpgateway.geehy.com')
 $ErrorActionPreference = 'Stop'
 $origin = $Gateway.GetLeftPart([UriPartial]::Authority)
 foreach ($path in @('/', '/realms/mcp-gateway/.well-known/openid-configuration')) {
