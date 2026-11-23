@@ -1,10 +1,11 @@
 """Provision a fresh Compose instance, preserving operator state on later runs."""
 
+import argparse
 import json
 import os
+import runpy
 import subprocess
 import sys
-import runpy
 from pathlib import Path
 from urllib.parse import quote, unquote, urlencode, urlsplit
 
@@ -102,7 +103,23 @@ def provision_realm(module: dict) -> None:
                     "--signup-mode", "open"], check=True)
 
 
-if __name__ == "__main__":
-    provision_mongo()
+def _main() -> None:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Example: python /setup/bootstrap.py mongo",
+    )
+    parser.add_argument("stage", choices=("mongo", "keycloak"))
+    stage = parser.parse_args().stage
+
+    if stage == "mongo":
+        provision_mongo()
+        print("MongoDB shim account verified.", flush=True)
+        return
+
     provision_realm(runpy.run_path(str(HERE / "configure-cas.py")))
-    print("MongoDB shim account and Keycloak CAS configuration verified.")
+    print("Keycloak CAS configuration verified.", flush=True)
+
+
+if __name__ == "__main__":
+    _main()

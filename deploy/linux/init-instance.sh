@@ -53,7 +53,10 @@ if cmp -s "$tmp" "$target"; then rm -f -- "$tmp"; else mv -- "$tmp" "$target"; f
 # Wait for the existing init container even when it already finished.
 init_id=$("${dc[@]}" ps -aq mongodb-init)
 [[ -n $init_id && $(docker wait "$init_id") == 0 ]] || { echo 'mongodb-init failed' >&2; exit 1; }
-"${dc[@]}" run --rm --no-deps enterprise-init
+"${dc[@]}" run --rm --no-deps enterprise-init mongo
+# Keycloak resolves the internal shim hostname when validating the broker URLs.
+"${dc[@]}" up -d --wait --wait-timeout 150 cas-shim
+"${dc[@]}" run --rm --no-deps enterprise-init keycloak
 "${dc[@]}" up -d --wait --wait-timeout 360 keycloak registry mcpgw-server cas-shim
 "${dc[@]}" exec -T registry nginx -t
 "${dc[@]}" ps -a
