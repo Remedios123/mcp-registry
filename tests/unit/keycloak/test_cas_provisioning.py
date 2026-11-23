@@ -54,6 +54,47 @@ def test_partial_scope_import_preserves_keycloak_builtin_mappers():
     assert basic["protocolMappers"][0]["id"] == "master-sub"
 
 
+@pytest.mark.parametrize("profile_was_optional", [False, True])
+def test_dcr_repairs_realm_email_and_profile_defaults(profile_was_optional):
+    api = Mock()
+    scopes = {name: f"id-{name}" for name in CONFIG["DCR_SCOPES"]}
+    default_path = "/default-default-client-scopes"
+    optional_path = "/default-optional-client-scopes"
+    defaults = {scopes["basic"], "id-custom-default"}
+    optional = {scopes["offline_access"]}
+    if profile_was_optional:
+        optional.add(scopes["profile"])
+    writes = []
+
+    def request(method, path):
+        if method == "GET" and path in (default_path, optional_path):
+            assigned = defaults if path == default_path else optional
+            return [{"id": scope_id} for scope_id in assigned]
+        collection, scope_id = path.rsplit("/", 1)
+        if method == "DELETE" and collection == optional_path:
+            optional.remove(scope_id)
+        else:
+            assert method == "PUT" and collection == default_path
+            assert scope_id not in optional
+            defaults.add(scope_id)
+        writes.append((method, collection, scope_id))
+
+    api.call.side_effect = request
+    configure = CONFIG["_configure_dcr"]
+    with patch.dict(configure.__globals__, _ensure_dcr_scopes=Mock(return_value=scopes),
+                    upsert_mapper=Mock(), _configure_registration=Mock()):
+        configure(api)
+        configure(api)
+
+    expected = [("PUT", default_path, scopes["email"])]
+    if profile_was_optional:
+        expected.append(("DELETE", optional_path, scopes["profile"]))
+    expected.append(("PUT", default_path, scopes["profile"]))
+    assert writes == expected
+    assert defaults == {scopes["basic"], scopes["email"], scopes["profile"], "id-custom-default"}
+    assert optional == {scopes["offline_access"]}
+
+
 @pytest.mark.parametrize("hosts", ["", "new.example"])
 def test_anonymous_policies_preserve_existing_restrictions(monkeypatch, hosts):
     monkeypatch.setenv("KEYCLOAK_DCR_TRUSTED_HOSTS", hosts)

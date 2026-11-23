@@ -245,8 +245,17 @@ def _configure_dcr(api: AdminAPI) -> None:
     scopes = _ensure_dcr_scopes(api)
     basic = scopes["basic"]
     defaults = "/default-default-client-scopes"
-    if not any(scope["id"] == basic for scope in api.call("GET", defaults)):
-        api.call("PUT", f"{defaults}/{basic}")
+    assigned_defaults = {scope["id"] for scope in api.call("GET", defaults)}
+    missing_defaults = [
+        scopes[name] for name in ("basic", "email", "profile") if scopes[name] not in assigned_defaults
+    ]
+    if missing_defaults:
+        optional = "/default-optional-client-scopes"
+        assigned_optional = {scope["id"] for scope in api.call("GET", optional)}
+        for scope_id in missing_defaults:
+            if scope_id in assigned_optional:
+                api.call("DELETE", f"{optional}/{scope_id}")
+            api.call("PUT", f"{defaults}/{scope_id}")
     upsert_mapper(api, f"/client-scopes/{basic}/protocol-mappers/models", {
         "name": "employee-id", "protocol": "openid-connect",
         "protocolMapper": "oidc-usermodel-attribute-mapper",
