@@ -8711,6 +8711,46 @@ class TestMcpProxyUnsupportedMethods:
 
         assert response.status_code == 403
 
+    @pytest.mark.parametrize(
+        ("server_name", "granted_server", "expected_status"),
+        [
+            ("airegistry-tools", "/airegistry-tools/", 200),
+            ("airegistry-tools", "another-server", 403),
+            ("another-server", "another-server", 403),
+        ],
+    )
+    def test_registry_tools_subscription_fallback_requires_server_access(
+        self, server_name, granted_server, expected_status
+    ):
+        import auth_server.server as server_module
+
+        repo = AsyncMock()
+        repo.get_server_scopes.return_value = [{"server": granted_server, "methods": ["tools/list"]}]
+        vend = AsyncMock()
+        upstream = _build_mock_upstream_response(
+            status_code=200, headers={"content-type": "application/json"}, body=b"{}"
+        )
+        upstream_patch, stream_calls, _ = _patch_upstream_client(upstream)
+        with (
+            patch.object(server_module, "get_scope_repository", return_value=repo),
+            patch.object(server_module.settings, "egress_auth_enabled", True),
+            patch.object(server_module, "_vend_egress_token", vend),
+            upstream_patch,
+        ):
+            client = TestClient(server_module.app)
+            response = client.post(
+                f"/mcp-proxy/{server_name}",
+                json={"jsonrpc": "2.0", "id": 42, "method": "subscriptions/listen"},
+                headers=_mcp_proxy_token_headers(server_name=server_name, scopes=["test-data"]),
+            )
+
+        assert response.status_code == expected_status
+        if expected_status == 200:
+            assert response.json()["error"]["code"] == -32601
+            assert response.json()["id"] == 42
+        vend.assert_not_awaited()
+        assert stream_calls["n"] == 0
+
     def test_tools_call_is_still_forwarded(self):
         import auth_server.server as server_module
 

@@ -2722,6 +2722,10 @@ def _is_connect_tool_call(
     return tool_name == _connect_tool_name(server_path)
 
 
+_AIREGISTRY_TOOLS_SERVER = "airegistry-tools"
+_MCP_SUBSCRIPTIONS_LISTEN = "subscriptions/listen"
+
+
 def _scope_check_target(
     server_path: str,
     method: str,
@@ -2736,6 +2740,10 @@ def _scope_check_target(
     direct-route MCP request passes through the mcp-proxy hop, which answers
     the connect tool locally. Virtual routes never get the exemption: nginx
     proxies a virtual route's non-egress backends straight to the backend.
+
+    A direct AI Registry subscription receives a local method-not-found
+    response from the buffering proxy. Check the same server grant as
+    discovery before allowing that response.
 
     Args:
         server_path: The registered server path being authorized.
@@ -2753,6 +2761,12 @@ def _scope_check_target(
             server_path,
         )
         return "tools/list", None
+    if (
+        direct_route
+        and method == _MCP_SUBSCRIPTIONS_LISTEN
+        and _normalize_server_name(server_path) == _AIREGISTRY_TOOLS_SERVER
+    ):
+        return "server/discover", None
     return method, tool_name
 
 
@@ -8391,7 +8405,7 @@ async def _read_bounded(
 # same-trust-domain component. Keyed on the verified, path-validated `server`
 # claim (first path segment). This is NOT a general relay feature -- external
 # servers that need an upstream credential use the egress vault.
-_INTERNAL_INGRESS_RELAY_SERVERS: frozenset[str] = frozenset({"airegistry-tools"})
+_INTERNAL_INGRESS_RELAY_SERVERS: frozenset[str] = frozenset({_AIREGISTRY_TOOLS_SERVER})
 
 
 def _relays_ingress_auth(
@@ -9226,7 +9240,7 @@ def _obo_error_response(req_id: object, detail: str):
 # buffered read would never finish and would hold an upstream connection, from
 # the shared egress pool on the egress path. Method-not-found lets the client
 # carry on without notifications.
-_MCP_PROXY_UNSUPPORTED_METHODS: frozenset[str] = frozenset({"subscriptions/listen"})
+_MCP_PROXY_UNSUPPORTED_METHODS: frozenset[str] = frozenset({_MCP_SUBSCRIPTIONS_LISTEN})
 _JSONRPC_METHOD_NOT_FOUND: int = -32601
 
 
